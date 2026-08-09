@@ -159,10 +159,37 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         lines.append(f"  (total host self = {total_host_us/1000:.1f} ms)")
         for cat, us in sorted(cat_agg.items(), key=lambda x: -x[1]):
             pct = us / total_host_us * 100
-            lines.append(f"  {cat:<24} {us/1000:>9.1f} ms  ({pct:>5.1f}%)")
+            lines.append(f"  {cat:<28} {us/1000:>9.1f} ms  ({pct:>5.1f}%)")
         sync_us = sum(v for k, v in cat_agg.items() if k.startswith("sync"))
         if sync_us / total_host_us > 0.2:
             lines.append(f"  - sync (D-H) 占主导 ({sync_us/total_host_us*100:.0f}%): 消除 .item()/.numpy()，缓存/延迟 sync")
+        # dispatch 合计（CANN 层 + PyTorch 层）
+        dispatch_total = sum(v for k, v in cat_agg.items() if k.startswith("dispatch"))
+        if dispatch_total > 0:
+            lines.append(f"  dispatch 合计:                {dispatch_total/1000:.1f} ms  ({dispatch_total/total_host_us*100:.1f}%)")
+        lines.append("")
+
+    # --- 'other' 类别自动分解 ---
+    # 当 other 占比 > 10% 时，列出其中的 Top op，避免 agent 手动从 Top-15 表关联。
+    other_us = cat_agg.get("other", 0)
+    other_pct = other_us / total_host_us * 100 if total_host_us > 0 else 0
+    if other_pct > 10:
+        other_ops_agg = {name: info for name, info in op_agg.items()
+                         if _host_category(name) == "other"}
+        other_sorted = sorted(other_ops_agg.items(), key=lambda x: -x[1]["host_us"])
+        lines.append(f"## 'other' 类别分解 (占比 {other_pct:.1f}%)")
+        lines.append("  以下 op 未匹配任何分类规则，按 host 时间排序:")
+        lines.append(f"  {'Op Name':<35} {'Count':>8} {'Host(ms)':>10}")
+        lines.append("  " + "-" * 55)
+        for name, info in other_sorted[:10]:
+            lines.append(f"  {name:<35} {info['count']:>8} {info['host_us']/1000:>10.1f}")
+        # 检测共同前缀模式
+        prefixes = set()
+        for name, _ in other_sorted:
+            if "::" in name:
+                prefixes.add(name.split("::")[0] + "::")
+        if prefixes:
+            lines.append(f"  共同前缀: {', '.join(sorted(prefixes))}")
         lines.append("")
 
     # --- Layer 归因 (B4/C6) ---

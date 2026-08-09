@@ -94,8 +94,8 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 **Phase 1 前期准备**：理解模型代码、搭建 NPU 环境、准备测试数据、构建 profiling 采集脚本和精度验证脚本。关键产出：可复现的**基线性能数据（L0 + wall-clock，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
 
 **Phase 2 瓶颈分析**：
-- **新轮次强制重置**：每轮 Phase 2 必须从零开始——重新采集 L1、重新运行分析脚本、重新计算下界和 gap。上一轮的分析结论/未实施方案/优化方向全部失效（性能 profile 已变）。
-- **下界分析（先做）**：计算三档下界（Roofline / L0 Computing / 对齐 wall-clock），分解 gap A/B，确定优化方向。详见 [bound_analysis.md](references/bound_analysis.md)。
+- **新轮次强制重置**：每轮 Phase 2 必须从零开始——重新采集 L1、重新运行分析脚本、重新估算下界。上一轮的分析结论/未实施方案/优化方向全部失效（性能 profile 已变）。
+- **下界分析（先做）**：估算优化空间——读取 L0 Computing 和 L0 Free，判断是否还有空间、还有多少。详见 [bound_analysis.md](references/bound_analysis.md)。
 - **Line B**:采集 **L1**,跑脚本,用两种分析模式定位可见瓶颈。
 - **Line A (必做)**:通读源码(穿透框架),用四维度审视,发现结构性冗余。用 Line B 的数据量化收益。
 - 两条线**都必须执行**,产出合并后进入**确认节点 A**。
@@ -106,7 +106,7 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 **Phase 4 精度验证 + Profiling 确认**：本批（本轮优化阶段）所有优化完成后，**必须依次完成**：
 1. 全量精度验证 —— 与原始 baseline 对比，确认精度无退化
-2. 重新采集 **wall-clock + L0** —— wall-clock 确认真实收益，L0 与基线/上一轮比对确认收益来源（gap A/B 变化）
+2. 重新采集 **wall-clock + L0** —— wall-clock 确认真实收益，L0 与基线/上一轮比对确认收益来源（L0 Computing 和 L0 Free 的变化）
 3. 两项均通过后才可进入提交流程；任一不通过则回退或调整
 
 **★ 确认节点 B**：向用户展示本批总结（优化点、性能收益、精度数据、未采纳方案），询问是否确认提交。用户确认后才执行 git commit。
@@ -117,11 +117,10 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 ## 迭代退出条件
 
-由用户在确认节点 C 中决定是否继续。agent 应基于三档下界的 gap 分析（定义见 [bound_analysis.md](references/bound_analysis.md)）提供量化建议。满足以下**任一**条件时建议停止：
+由用户在确认节点 C 中决定是否继续。agent 应基于下界分析（定义见 [bound_analysis.md](references/bound_analysis.md)）提供量化建议。满足以下**任一**条件时建议停止：
 
-1. `wall_clock / L0_Computing < 1.1`——host 开销（gap B）已极小，Python 层优化空间耗尽
-2. gap A 主导（kernel 效率差距大）且 gap B / Tier 3 < 5%——Python 层无法改善，需图编译/量化/换 CANN
-3. 连续 2 轮优化均 < 2% wall-clock 改进
-4. 所有候选被拒绝且无新候选产生
+1. `L0 Free < wall-clock × 10%`——device 几乎不停，优化空间在 device 侧，Python 层优化接近极限
+2. L0 Free > 0 但连续 2 轮优化均 < 2% wall-clock 改进——虽然 Free 仍存在但已无法有效消除
+3. 所有候选被拒绝且无新候选产生
 
 终局判断前必须穷尽 NPU 融合算子库，不能仅看 utilization 数字下结论。

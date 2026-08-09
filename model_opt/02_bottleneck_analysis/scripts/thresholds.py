@@ -105,13 +105,17 @@ THRESHOLDS = {
         "hd_ratio_display_cap": 10000,      # display "∞" above this
         # Host category classification rules (C1). Classify by op ROLE, not name —
         # these patterns are framework defaults, adjust per model/framework. Order
-        # matters: first match wins (sync > dispatch > copy > alloc > framework > compile).
+        # matters: first match wins (sync > alloc > H2D > dispatch-cann > dispatch-aten > framework > compile).
+        # Key: alloc and H2D must come BEFORE dispatch(aten) so that aten::slice
+        # matches alloc (not dispatch) and aten::to matches H2D (not dispatch).
         "host_category_rules": {
             "sync (D-to-H)": ["_local_scalar", "::item", ".item", "numpy"],
-            "dispatch (aclnn launch)": ["aclnn"],
-            "H2D/D2H copy": ["copy_", "_to_copy", "to_copy", "memcpy", "::to"],
             "alloc/metadata": ["empty", "as_strided", "view", "reshape", "clone",
-                               "contiguous", "detach", "expand", "squeeze", "unsqueeze"],
+                               "contiguous", "detach", "expand", "squeeze", "unsqueeze",
+                               "slice", "select", "resize_"],
+            "H2D/D2H copy": ["copy_", "_to_copy", "to_copy", "memcpy", "::to"],
+            "dispatch (CANN aclnn)": ["aclnn"],
+            "dispatch (PyTorch aten)": ["aten::"],
             "framework/comm": ["c10d::", "profiler", "broadcast_"],
             "compile": ["compile", "opcompile"],
         },

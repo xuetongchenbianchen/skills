@@ -1,6 +1,6 @@
 ---
 name: npu-optimization-implementation
-description: 优化实施：用去重/复用/掩盖/替换四维度框架实施性能优化。当用户需要实施优化方案、融合算子、预分配 buffer、图编译、flat forward、或换等价实现时触发。
+description: 优化实施：用去重/复用/掩盖/替换四维度框架实施性能优化。当用户需要实施优化方案、融合算子、预分配 buffer、编译工具（TorchScript/torch.compile）、flat forward、或换等价实现时触发。
 ---
 
 # NPU 优化实施
@@ -30,7 +30,7 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
 |------|-----------|---------|
 | 去重 | [eliminate_redundancy.md](references/eliminate_redundancy.md) | 合并调用、消除冗余、清理框架开销 |
 | 复用 | [reuse_and_precompute.md](references/reuse_and_precompute.md) | 预计算缓存、预分配 buffer、原地操作 |
-| 掩盖 | [hide_latency.md](references/hide_latency.md) | 通信-计算重叠、双 buffer 流水、图编译 |
+| 掩盖 | [hide_latency.md](references/hide_latency.md) | 通信-计算重叠、双 buffer 流水 |
 | 替换 | [equivalent_substitution.md](references/equivalent_substitution.md) | NPU 融合算子、换等价 API、换算法 |
 
 ## 场景专用 Reference
@@ -41,7 +41,7 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
 |-----------|---------|---------|
 | [npu_checklist.md](references/npu_checklist.md) | 始终加载 | NPU 已知性能陷阱的 grep 扫描清单 |
 | [npu_operator_catalog.yaml](references/npu_operator_catalog.yaml) | 替换维度层 1 时加载 | 融合算子目录（被 equivalent_substitution.md 引用） |
-| [decode_optimization.md](references/decode_optimization.md) | 自回归 decode 场景 | KV cache 预分配、EOS 检查降频、消除 per-step 冗余 |
+| [compilation_tools.md](references/compilation_tools.md) | host-bound 时 | TorchScript/jit.trace/torch.compile(npu)/NPU JIT 的选择决策树、兼容性排查、编译粒度决策 |
 | [parallel_design.md](references/parallel_design.md) | 多卡并行场景 | 切分维度选择、通信原语选型、并行区域设计 |
 
 ## 通用原则
@@ -56,6 +56,7 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
   - "但任何改变操作序列的优化必须用 L0 端到端 benchmark 验证"——不能只看 profiling 中的算子级数据，因为异步流水线的重叠效果只在端到端时间中体现
   - 若优化导致端到端回退但 profiling 显示算子级改善，根因是异步流水线耦合——记录此发现，可考虑通过自适应阈值（如不同输入规模用不同实现）规避
 - **深度优先于广度**：对每个优化方向，穷尽探索（多种实现、完整验证）比浅尝多个方向更有价值。如果环境支持子 agent，建议对独立的方向/算子 spawn 子 agent 逐个深挖，避免因同时处理太多方向而浅尝辄止
+- **编译工具优先尝试**：Phase 2 分析完瓶颈后，Phase 3 先用 npu_checklist 扫描并解决 D2H 同步、AI CPU 回退等编译无法覆盖的结构性问题，然后尝试编译工具（TorchScript / torch.jit.trace / torch.compile(npu)），因为编译自动消除大量框架级开销（Python 解释器、Module.__call__、属性查找），不需要手动 inline 或预提取。编译后重新 profiling，数据更准确，再用四维度解决编译无法覆盖的剩余问题。如果编译失败，用四维度出发解决兼容性问题后重试。详见 [compilation_tools.md](references/compilation_tools.md)。
 
 ## 方向放弃标准（分级）
 

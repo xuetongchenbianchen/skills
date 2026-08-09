@@ -35,16 +35,6 @@ NPU 设备可以同时做 DMA 传输（通信）和 AI Core 计算。让通信�
 
 **典型场景**：输出由多段拼接而成，且第一段在前序计算之前就可用——先分配 buffer 并写入第一段（异步执行），同时执行前序计算产出后续段，最后写入剩余部分。
 
-### 图编译（掩盖的极端形态）
-
-图编译将多个算子合成一个子图，设备侧一次性调度执行——逐算子 dispatch 时每个 kernel 间有 host 调度间隙，编译后这些间隙被设备内部流水线掩盖。是 host-bound 场景的终极手段。
-
-**前置条件检查**：优先 torchair（NPU 专用，不依赖 triton）；其次 torch.compile（依赖 triton）；最后 NPU JIT 编译（可能触发 tiling error）。若都不可用，回退 eager 模式，通过减少 kernel 数量（融合算子、flat forward）缓解 host-bound。
-
-**编译范围策略**：挑"碎而密"的地方编，不挑"大而炸"的地方编。从纯计算子模块开始逐渐扩大范围，形状固定的子图优先。不要直接 `torch.compile(model)`——控制流、side-effect 会切图。
-
-**放弃条件**：算子不兼容（编译报错且无法绕过）、图太大导致编译期 OOM、触发框架 bug（如 tiling error）、精度不达标且无法通过调整编译选项修复、编译时间过长且无法缓存。回退后记录失败原因到 evidence_db。
-
 ## 环境配置
 
 `TASK_QUEUE_ENABLE=2` 使 Host 下发和 Device 执行在时间上重叠，是异步流水线的基础。注意：`ASCEND_LAUNCH_BLOCKING=1` 时 task_queue 关闭不生效；可能导致 NPU 内存峰值上升，遇 OOM 可回退到 `=1`。
