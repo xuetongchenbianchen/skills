@@ -22,7 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import threshold, find_ascend_profiler_output, read_csv_all, safe_float, safe_int, format_duration_ms
+from common import threshold, find_ascend_profiler_output, read_csv_all, safe_float, safe_int
 
 
 def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
@@ -33,11 +33,14 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
     if not rows:
         return f"[api_statistic] 文件未找到或为空: {csv_path}\n(api_statistic.csv 在 L1 生成；L0 下不存在。)"
 
+    # Level 名称规范化（兼容不同 CANN 版本）
+    _LEVEL_MAP = {"ascendcl": "acl", "hccl": "communication"}
     # 按 Level 聚合
     by_level = defaultdict(lambda: {"count": 0, "time_us": 0.0, "apis": []})
     total_time = 0.0
     for r in rows:
-        lv = r.get("Level", "?").strip()
+        lv_raw = r.get("Level", "?").strip()
+        lv = _LEVEL_MAP.get(lv_raw.lower(), lv_raw.lower())
         cnt = safe_int(r.get("Count", 0))
         t = safe_float(r.get("Time(us)", 0))
         avg = safe_float(r.get("Avg(us)", 0))
@@ -71,13 +74,15 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
         lines.append("  " + "-" * (len(header) - 2))
         for t, name, cnt, avg, mx in sorted(acl["apis"], key=lambda x: -x[0])[:top_k]:
             lines.append(f"  {name:<32} {cnt:>7} {t/1000:>10.2f} {avg:>9.2f} {mx:>9.2f}")
-        # tiling 小计
-        tiling_us = sum(t for t, n, *_ in acl["apis"] if n.endswith("_Tiling"))
-        if tiling_us > 0:
+        # host 侧预计算小计（tiling + workspace）
+        tiling_us = sum(t for t, n, *_ in acl["apis"] if n.lower().endswith("_tiling"))
+        workspace_us = sum(t for t, n, *_ in acl["apis"] if "getworkspacesize" in n.lower())
+        if tiling_us > 0 or workspace_us > 0:
             lines.append("")
-            lines.append(f"  Tiling 小计: {tiling_us/1000:.1f} ms ({tiling_us/total_time*100:.1f}% 占全部 API 时间)")
-            if tiling_us / total_time > 0.3:
-                lines.append("  - Tiling 主导 ACL API 耗时。若 shape 为静态/重复，每次调用都会重新计算 tiling — 应缓存 (graph compile / op cache)。")
+            host_pre = tiling_us + workspace_us
+            lines.append(f"  Host 侧预计算: tiling={tiling_us/1000:.1f}ms  workspace={workspace_us/1000:.1f}ms  合计={host_pre/1000:.1f}ms ({host_pre/total_time*100:.1f}%)")
+            if host_pre / total_time > threshold("api_statistic", "host_precompute_ratio", 0.2):
+                lines.append("  - 每次 aclnn 调用前的 host 侧计算。shape 不变时可缓存；图模式自动缓存。")
         lines.append("")
 
     # node launch（count 应与 trace_view Node@launch 一致）
@@ -86,7 +91,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
         lines.append("## Node 级 Launch")
         for t, name, cnt, avg, mx in node["apis"]:
             lines.append(f"  {name}: count={cnt:,}  total={t/1000:.1f}ms  avg={avg:.1f}us")
-        lines.append(f"  (count 应与 trace_view Node@launch 事件一致。)")
+        lines.append(f"  (count 应与 trace_view Node@launch 事件一致)")
         lines.append("")
 
     # communication API
@@ -107,6 +112,10 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
                 cat_us["memory mgmt"] += t
             elif "sync" in nl:
                 cat_us["stream/device sync"] += t
+            elif "compile" in nl:
+                cat_us["compile"] += t
+            elif "getworkspacesize" in nl:
+                cat_us["workspace"] += t
             elif nl.endswith("_tiling"):
                 cat_us["tiling"] += t
             elif "launch" in nl:
@@ -118,10 +127,12 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
             dom_pct = dom_us / total_time * 100 if total_time > 0 else 0
             for c, u in sorted(cat_us.items(), key=lambda x: -x[1]):
                 lines.append(f"  {c:<16} {u/1000:>9.1f} ms ({u/total_time*100 if total_time>0 else 0:>5.1f}%)")
-            if dom_pct > 20:
+            if dom_pct > threshold("api_statistic", "dominant_category_pct", 20):
                 hint = {
-                    "memory mgmt": "- Memory mgmt 主导 ACL API 耗时（Free/Malloc/Unmap）。高 churn = 频繁 alloc/free；交叉验证 operator_memory 的重复 alloc - buffer 复用。",
-                    "stream/device sync": "- Sync 主导 ACL API 耗时（SynchronizeStream/Device）。显式 sync 或 .item() 强制 D-H；交叉验证 operator_details 的 sync category。",
+                    "memory mgmt": "- Memory mgmt 主导（Free/Malloc/Unmap）。高 churn = 频繁 alloc/free；buffer 复用可减少。operator_memory 可确认重复 alloc。",
+                    "stream/device sync": "- Sync 主导（SynchronizeStream/Device）。显式 sync 或 .item() 强制 D-H；避免循环中隐式同步。operator_details 的 sync category 可定位触发源。",
+                    "compile": "- JIT 编译主导（aclopCompileAndExecute）。推理前 warmup 确保所有 shape 编译过；频繁新 shape 会反复触发。",
+                    "workspace": "- GetWorkspaceSize 主导。每次 aclnn 调用前 CANN 计算 workspace 需求，shape 不变时可缓存；图模式自动缓存。",
                     "tiling": "- Tiling 主导；为静态/重复 shape 缓存 tiling (graph compile / op cache)。",
                     "launch": "- Launch overhead；减少 op 数量 (fusion / graph compile)。",
                 }.get(dom_cat, "")
@@ -130,9 +141,9 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
     else:
         lines.append("  无")
     lines.append("")
-    lines.append("## 交叉验证")
-    lines.append("  - 对比 operator_details: 此处的 tiling/launch 是该处所示 host 时间的 CANN-API 层（按 op 名）。")
-    lines.append("  - 对比 trace_view: node launch count 与 Node@launch 一致；tiling 在 host thread 上先于每次 launch。")
+    lines.append("## 关联")
+    lines.append("  - operator_details: 此处的 tiling/launch 是该处 host 时间的 CANN-API 层（按 op 名）")
+    lines.append("  - trace_view: node launch count 与 Node@launch 一致；tiling 在 host thread 上先于每次 launch")
     lines.append("")
 
     return "\n".join(lines)

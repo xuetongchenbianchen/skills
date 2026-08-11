@@ -60,7 +60,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
    - 设备空闲 / 流间隙（来自 step_trace / trace_view）→ trace_view 的 Host2Device Bound Regions + async_npu flow 回连 cpu_op Call Stack → 定位哪段 Python 代码导致设备等待
    - Host 开销分类中的"other"占比高（来自 operator_details）→ 该类别是未归类的 host 操作聚合 → 按 host self time 排序找到具体算子 → `--filter` 追 Call Stack
    - 内存高频抖动（来自 memory_record / operator_memory）→ 重复同尺寸分配列表 → 对应算子的 Call Stack → 定位哪个操作在反复分配/释放
-   - AI_CPU 回退（来自 kernel_details Accelerator Core）→ `--filter <op>` 获取 Input Shapes → 判断 dtype/shape 是否不匹配导致 fallback
+   - AI_CPU 回退（来自 op_statistic Core Type 分布）→ `--filter <op>` 获取 Input Shapes → 判断 dtype/shape 是否不匹配导致 fallback
 
    **执行规则**：
    - 每个脚本运行后，先记录该脚本产出的所有 DEFINITE/WARNING 信号
@@ -78,7 +78,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
 如需对单个脚本做 `--filter` 深入查询（如 `parse_operator_details --filter Transpose` 获取 Call Stack），可单独调用对应脚本。
 
 **门禁规则**：
-- 报告中任何 **DEFINITE** 信号或 **WARNING 警告**（由脚本自身定义，如"SEVERE Host-Bound"、"AI_CPU detected"、"高频抖动"）**必须**在确认节点 A 中产生对应候选，或附 profiling 数据依据显式排除
+- 报告中任何 **DEFINITE** 信号或 **WARNING 警告**（由脚本自身定义，如"严重 Host-Bound"、"AI_CPU Fallback"、"高内存 churn"）**必须**在确认节点 A 中产生对应候选，或附 profiling 数据依据显式排除
 
 ## 下一步
 

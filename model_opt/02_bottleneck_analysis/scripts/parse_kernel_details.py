@@ -19,7 +19,7 @@ Block Dim（并行度）以及 cube 利用率。
 import argparse
 import heapq
 import sys
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -41,30 +41,29 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # Accelerator core 拆分
     core_stats = defaultdict(lambda: {"count": 0, "dur_us": 0.0})
 
-    # 硬件单元聚合（针对 AI_CORE）
+    # 硬件单元聚合（duration 加权 — 按 kernel 执行时间加权，反映时间真实分布）
     aic_kernels = 0
-    aic_mac_sum = 0.0
-    aic_mte1_sum = 0.0
-    aic_mte2_sum = 0.0
-    aic_scalar_sum = 0.0
-    # duration 加权（少数重型 kernel 占主导；算术平均会掩盖双峰分布）
     aic_dur_sum = 0.0
     aic_mac_wsum = 0.0
-    aic_mte_wsum = 0.0
-    aic_fixpipe_sum = 0.0
-    aic_icache_values = []
+    aic_mte1_wsum = 0.0
+    aic_mte2_wsum = 0.0
+    aic_scalar_wsum = 0.0
+    aic_fixpipe_wsum = 0.0
+    aic_icache_wsum = 0.0
+    aic_icache_dur_sum = 0.0
+    aic_icache_max = 0.0
     format_counts = defaultdict(int)
 
-    # 硬件单元聚合（针对 AI_VECTOR_CORE）
+    # 硬件单元聚合（AI_VECTOR_CORE）
     aiv_kernels = 0
-    aiv_vec_sum = 0.0
-    aiv_mte2_sum = 0.0
-    aiv_mte3_sum = 0.0
-    aiv_scalar_sum = 0.0
     aiv_dur_sum = 0.0
     aiv_vec_wsum = 0.0
-    aiv_mte_wsum = 0.0
-    aiv_icache_values = []
+    aiv_mte2_wsum = 0.0
+    aiv_mte3_wsum = 0.0
+    aiv_scalar_wsum = 0.0
+    aiv_icache_wsum = 0.0
+    aiv_icache_dur_sum = 0.0
+    aiv_icache_max = 0.0
 
     # 小 kernel 跟踪
     small_count = 0
@@ -74,26 +73,34 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # Kernel duration 分布（5 个桶）
     dur_buckets = {"<5us": 0, "5-20us": 0, "20-50us": 0, "50-200us": 0, ">200us": 0}
 
-    # Block Dim 分布
-    block_dim_buckets = {"1": 0, "2-8": 0, "9-28": 0, "29+": 0}
+    # Block Dim 分布（duration 加权，仅 AI_CORE/AI_VECTOR_CORE）
+    block_dim_dur = {"1": 0.0, "2-8": 0.0, "9-28": 0.0, "29+": 0.0}
+    block_dim_total_dur = 0.0
+    _bd_bounds = threshold("kernel_details", "block_dim_buckets", [8, 28])
 
-    # Cube 利用率跟踪（仅 AI_CORE）
-    cube_util_values = []
+    # 提取 threshold 值到循环外（避免热循环中重复调用）
+    _suspect_min_dur = threshold("kernel_details", "suspect_min_duration_us", 10)
+    _suspect_mac = threshold("kernel_details", "suspect_mac_ratio", 0.2)
+    _compute_bound_mac = threshold("kernel_details", "compute_bound_mac_ratio", 0.5)
+    _suspect_vec = threshold("kernel_details", "suspect_vec_ratio", 0.05)
+    _cube_low = threshold("kernel_details", "cube_low_util", 50)
+
+    # Cube 利用率跟踪（仅 AI_CORE，duration 加权）
+    cube_util_wsum = 0.0
+    cube_util_dur_sum = 0.0
+    cube_util_min = float("inf")
+    cube_low_util_count = 0
+    cube_total_count = 0
 
     # 可疑 kernel：高 duration 但低 compute ratio（两种 core 类型）
     suspect_heap = []
     # 真正的 compute-bound：高 duration 且高 compute ratio（replace/quant 目标）
     compute_bound_heap = []
 
-    # AI_CPU fallback 跟踪（排除 communication 算子 — 它们按设计运行在 AI CPU 上）
-    aicpu_kernels = []  # (dur, name, op_type, shapes) — 仅非 comm
-    aicpu_comm_count = 0  # AI CPU 上的 communication 算子（预期行为，非问题）
-    COMM_KEYWORDS = tuple(threshold("kernel_details", "comm_keywords",
-                     ["broadcast", "allgather", "alltoall", "allreduce", "hcom", "send", "recv", "reducescatter"]))
-
     # Wait time 分布桶
     _wb = threshold("kernel_details", "wait_buckets_us", [100, 500, 2000])
-    wait_buckets = {f"<{_wb[0]}us": 0, f"{_wb[0]}-{_wb[1]}us": 0, f"{_wb[1]}-{_wb[2]}us": 0, f">{_wb[2]}us": 0}
+    _wk = [f"<{_wb[0]}us", f"{_wb[0]}-{_wb[1]}us", f"{_wb[1]}-{_wb[2]}us", f">{_wb[2]}us"]
+    wait_buckets = {k: 0 for k in _wk}
 
     # 高 wait kernel 及上下文
     all_kernels = []
@@ -133,20 +140,27 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
             scalar_ratio = safe_float(row.get("aic_scalar_ratio", 0))
             fixpipe_ratio = safe_float(row.get("aic_fixpipe_ratio", 0))
             icache_miss = safe_float(row.get("aic_icache_miss_rate", 0))
-            aic_mac_sum += mac_ratio
-            aic_mte1_sum += mte1_ratio
-            aic_mte2_sum += mte2_ratio
-            aic_scalar_sum += scalar_ratio
-            aic_fixpipe_sum += fixpipe_ratio
-            if icache_miss > 0:
-                aic_icache_values.append(icache_miss)
             aic_dur_sum += dur
             aic_mac_wsum += mac_ratio * dur
-            aic_mte_wsum += (mte1_ratio + mte2_ratio) * dur
+            aic_mte1_wsum += mte1_ratio * dur
+            aic_mte2_wsum += mte2_ratio * dur
+            aic_scalar_wsum += scalar_ratio * dur
+            aic_fixpipe_wsum += fixpipe_ratio * dur
+            if icache_miss > 0:
+                aic_icache_wsum += icache_miss * dur
+                aic_icache_dur_sum += dur
+                if icache_miss > aic_icache_max:
+                    aic_icache_max = icache_miss
             if cube_util > 0:
-                cube_util_values.append(cube_util)
+                cube_util_wsum += cube_util * dur
+                cube_util_dur_sum += dur
+                cube_total_count += 1
+                if cube_util < cube_util_min:
+                    cube_util_min = cube_util
+                if cube_util < _cube_low:
+                    cube_low_util_count += 1
             # 可疑：高 duration 但 compute ratio 低
-            if dur > threshold("kernel_details", "suspect_min_duration_us", 10) and mac_ratio < threshold("kernel_details", "suspect_mac_ratio", 0.2):
+            if dur > _suspect_min_dur and mac_ratio < _suspect_mac:
                 entry = (dur, total_rows, name, core, mac_ratio,
                          mte1_ratio + mte2_ratio, row.get("Input Shapes", ""), block_dim)
                 if len(suspect_heap) < top_k:
@@ -154,7 +168,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
                 elif dur > suspect_heap[0][0]:
                     heapq.heapreplace(suspect_heap, entry)
             # 真正的 compute-bound：高 duration 且高 mac ratio（replace/quant 目标）
-            if dur > threshold("kernel_details", "suspect_min_duration_us", 10) and mac_ratio >= threshold("kernel_details", "compute_bound_mac_ratio", 0.5):
+            if dur > _suspect_min_dur and mac_ratio >= _compute_bound_mac:
                 cb_entry = (dur, total_rows, name, core, mac_ratio, block_dim, row.get("Input Shapes", ""))
                 if len(compute_bound_heap) < top_k:
                     heapq.heappush(compute_bound_heap, cb_entry)
@@ -168,30 +182,24 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
             aiv_mte3_ratio = safe_float(row.get("aiv_mte3_ratio", 0))
             aiv_scalar_ratio_val = safe_float(row.get("aiv_scalar_ratio", 0))
             aiv_icache_miss = safe_float(row.get("aiv_icache_miss_rate", 0))
-            aiv_vec_sum += vec_ratio
-            aiv_mte2_sum += aiv_mte2_ratio
-            aiv_mte3_sum += aiv_mte3_ratio
-            aiv_scalar_sum += aiv_scalar_ratio_val
-            if aiv_icache_miss > 0:
-                aiv_icache_values.append(aiv_icache_miss)
             aiv_dur_sum += dur
             aiv_vec_wsum += vec_ratio * dur
-            aiv_mte_wsum += (aiv_mte2_ratio + aiv_mte3_ratio) * dur
+            aiv_mte2_wsum += aiv_mte2_ratio * dur
+            aiv_mte3_wsum += aiv_mte3_ratio * dur
+            aiv_scalar_wsum += aiv_scalar_ratio_val * dur
+            if aiv_icache_miss > 0:
+                aiv_icache_wsum += aiv_icache_miss * dur
+                aiv_icache_dur_sum += dur
+                if aiv_icache_miss > aiv_icache_max:
+                    aiv_icache_max = aiv_icache_miss
             # 可疑：高 duration 但 vec ratio 低
-            if dur > threshold("kernel_details", "suspect_min_duration_us", 10) and vec_ratio < threshold("kernel_details", "suspect_vec_ratio", 0.05):
+            if dur > _suspect_min_dur and vec_ratio < _suspect_vec:
                 entry = (dur, total_rows, name, core, vec_ratio,
                          aiv_mte2_ratio + aiv_mte3_ratio, row.get("Input Shapes", ""), block_dim)
                 if len(suspect_heap) < top_k:
                     heapq.heappush(suspect_heap, entry)
                 elif dur > suspect_heap[0][0]:
                     heapq.heapreplace(suspect_heap, entry)
-
-        elif "AI_CPU" in core:
-            low_type = op_type.lower()
-            if any(kw in low_type for kw in COMM_KEYWORDS):
-                aicpu_comm_count += 1
-            else:
-                aicpu_kernels.append((dur, name, op_type, row.get("Input Shapes", "")))
 
         # 小 kernel
         if dur < small_threshold and dur > 0:
@@ -207,25 +215,27 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
             elif dur < 200: dur_buckets["50-200us"] += 1
             else: dur_buckets[">200us"] += 1
 
-        # Block Dim
-        if block_dim == 1:
-            block_dim_buckets["1"] += 1
-        elif block_dim <= threshold("kernel_details", "block_dim_buckets", [8, 28])[0]:
-            block_dim_buckets["2-8"] += 1
-        elif block_dim <= threshold("kernel_details", "block_dim_buckets", [8, 28])[1]:
-            block_dim_buckets["9-28"] += 1
-        else:
-            block_dim_buckets["29+"] += 1
+        # Block Dim (仅 AI_CORE/AI_VECTOR_CORE，block_dim=0 无意义)
+        if block_dim > 0 and dur > 0 and core in ("AI_CORE", "AI_VECTOR_CORE"):
+            if block_dim == 1:
+                block_dim_dur["1"] += dur
+            elif block_dim <= _bd_bounds[0]:
+                block_dim_dur["2-8"] += dur
+            elif block_dim <= _bd_bounds[1]:
+                block_dim_dur["9-28"] += dur
+            else:
+                block_dim_dur["29+"] += dur
+            block_dim_total_dur += dur
 
         # Wait time 桶
-        if wait < 100:
-            wait_buckets["<100us"] += 1
-        elif wait < 500:
-            wait_buckets["100-500us"] += 1
-        elif wait < 2000:
-            wait_buckets["500-2000us"] += 1
+        if wait < _wb[0]:
+            wait_buckets[_wk[0]] += 1
+        elif wait < _wb[1]:
+            wait_buckets[_wk[1]] += 1
+        elif wait < _wb[2]:
+            wait_buckets[_wk[2]] += 1
         else:
-            wait_buckets[">2000us"] += 1
+            wait_buckets[_wk[3]] += 1
 
         # 存储用于上下文分析（含 start time + stream，用于时间分组）
         all_kernels.append({"name": name, "type": op_type, "dur": dur, "wait": wait,
@@ -277,96 +287,63 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     for core, info in sorted(core_stats.items(), key=lambda x: -x[1]["dur_us"]):
         pct = info["dur_us"] / total_dur_us * 100 if total_dur_us > 0 else 0
         lines.append(f"  {core}: {info['count']:,} 个 kernel, {info['dur_us']/1000:.1f}ms ({pct:.1f}%)")
-    if aicpu_kernels:
-        lines.append(f"  [!] 检测到非 comm 的 AI_CPU: {len(aicpu_kernels)} 个 kernel — 详见第 3 节")
-    if aicpu_comm_count:
-        lines.append(f"  ({aicpu_comm_count} 个 communication 算子运行在 AI_CPU 上 — 预期行为，非问题)")
-    # Core 切换检测：若 AI_CORE 与 AI_VECTOR_CORE 均显著，频繁切换可能产生 overhead
-    aic_dur = core_stats.get("AI_CORE", {}).get("dur_us", 0)
-    aiv_dur = core_stats.get("AI_VECTOR_CORE", {}).get("dur_us", 0)
-    if aic_dur > 0 and aiv_dur > 0:
-        ratio = min(aic_dur, aiv_dur) / max(aic_dur, aiv_dur)
-        if ratio > 0.3:
-            lines.append(f"  [SIGNAL] AI_CORE ({aic_dur/1000:.1f}ms) 与 AI_VECTOR_CORE ({aiv_dur/1000:.1f}ms) 均显著 (ratio={ratio:.2f})")
     lines.append("")
 
     # --- 2. 硬件单元利用率 ---
-    lines.append("## 2. 硬件单元利用率（平均 ratio）")
+    lines.append("## 2. 硬件单元利用率（duration 加权）")
     if aic_kernels > 0:
-        lines.append(f"  AI_CORE ({aic_kernels} 个 kernel):")
-        lines.append(f"    mac (compute):  {aic_mac_sum/aic_kernels:.3f}")
-        lines.append(f"    mte1 (load):    {aic_mte1_sum/aic_kernels:.3f}")
-        lines.append(f"    mte2 (store):   {aic_mte2_sum/aic_kernels:.3f}")
-        lines.append(f"    scalar:         {aic_scalar_sum/aic_kernels:.3f}")
-        lines.append(f"    fixpipe:        {aic_fixpipe_sum/aic_kernels:.3f}")
-        if aic_icache_values:
-            lines.append(f"    icache miss:    avg={sum(aic_icache_values)/len(aic_icache_values):.3f}  max={max(aic_icache_values):.3f}")
-        if aic_dur_sum > 0:
-            wmac = aic_mac_wsum / aic_dur_sum
-            wmte = aic_mte_wsum / aic_dur_sum
-            lines.append(f"    [duration-weighted] mac={wmac:.3f}  mte={wmte:.3f}  （重型 kernel 占主导；与上方算术平均对比以观察双峰分布）")
-            avg_mac = wmac
-            avg_mte = wmte
-        else:
-            avg_mac = aic_mac_sum / aic_kernels
-            avg_mte = (aic_mte1_sum + aic_mte2_sum) / aic_kernels
+        lines.append(f"  AI_CORE ({aic_kernels} 个 kernel, {aic_dur_sum/1000:.1f}ms):")
+        wmac = aic_mac_wsum / aic_dur_sum
+        wmte1 = aic_mte1_wsum / aic_dur_sum
+        wmte2 = aic_mte2_wsum / aic_dur_sum
+        lines.append(f"    mac (compute):  {wmac:.3f}")
+        lines.append(f"    mte1 (load):    {wmte1:.3f}")
+        lines.append(f"    mte2 (store):   {wmte2:.3f}")
+        lines.append(f"    scalar:         {aic_scalar_wsum/aic_dur_sum:.3f}")
+        lines.append(f"    fixpipe:        {aic_fixpipe_wsum/aic_dur_sum:.3f}")
+        if aic_icache_dur_sum > 0:
+            lines.append(f"    icache miss:    avg={aic_icache_wsum/aic_icache_dur_sum:.3f}  max={aic_icache_max:.3f}")
+        avg_mac = wmac
+        avg_mte = wmte1 + wmte2
         if avg_mte > avg_mac * threshold("kernel_details", "hw_dominance_ratio", 1.5):
             lines.append(f"    - Memory 主导: mte ({avg_mte:.3f}) >> mac ({avg_mac:.3f})")
         elif avg_mac > avg_mte * threshold("kernel_details", "hw_dominance_ratio", 1.5):
             lines.append(f"    - Compute 主导: mac ({avg_mac:.3f}) >> mte ({avg_mte:.3f})")
     if aiv_kernels > 0:
-        lines.append(f"  AI_VECTOR_CORE ({aiv_kernels} 个 kernel):")
-        lines.append(f"    vec (compute):  {aiv_vec_sum/aiv_kernels:.3f}")
-        lines.append(f"    mte2 (load):    {aiv_mte2_sum/aiv_kernels:.3f}")
-        lines.append(f"    mte3 (store):   {aiv_mte3_sum/aiv_kernels:.3f}")
-        lines.append(f"    scalar:         {aiv_scalar_sum/aiv_kernels:.3f}")
-        if aiv_icache_values:
-            lines.append(f"    icache miss:    avg={sum(aiv_icache_values)/len(aiv_icache_values):.3f}  max={max(aiv_icache_values):.3f}")
-        if aiv_dur_sum > 0:
-            lines.append(f"    [duration-weighted] vec={aiv_vec_wsum/aiv_dur_sum:.3f}  mte={aiv_mte_wsum/aiv_dur_sum:.3f}")
+        lines.append(f"  AI_VECTOR_CORE ({aiv_kernels} 个 kernel, {aiv_dur_sum/1000:.1f}ms):")
+        lines.append(f"    vec (compute):  {aiv_vec_wsum/aiv_dur_sum:.3f}")
+        lines.append(f"    mte2 (load):    {aiv_mte2_wsum/aiv_dur_sum:.3f}")
+        lines.append(f"    mte3 (store):   {aiv_mte3_wsum/aiv_dur_sum:.3f}")
+        lines.append(f"    scalar:         {aiv_scalar_wsum/aiv_dur_sum:.3f}")
+        if aiv_icache_dur_sum > 0:
+            lines.append(f"    icache miss:    avg={aiv_icache_wsum/aiv_icache_dur_sum:.3f}  max={aiv_icache_max:.3f}")
     # Format 分布 (A2)：非 ND format 表明存在 layout 转换开销
     if format_counts:
         total_fmt = sum(format_counts.values())
         non_nd = sum(c for f, c in format_counts.items() if f != "ND" and f != "N/A")
         lines.append(f"  Input Formats: {dict(sorted(format_counts.items(), key=lambda x: -x[1]))}")
-        if non_nd / total_fmt > 0.1 if total_fmt else False:
-            lines.append(f"  - {non_nd}/{total_fmt} ({non_nd/total_fmt*100:.0f}%) 非 ND input format — layout 转换开销；交叉验证 op_statistic 的 Transpose/Cast。")
-    if cube_util_values:
-        avg_cube = sum(cube_util_values) / len(cube_util_values)
-        min_cube = min(cube_util_values)
-        low_util_count = sum(1 for v in cube_util_values if v < threshold("kernel_details", "cube_low_util", 50))
-        lines.append(f"  Cube 利用率: avg={avg_cube:.1f}%, min={min_cube:.1f}%, "
-                     f"low(<50%)={low_util_count}/{len(cube_util_values)}")
+        if (non_nd / total_fmt > threshold("kernel_details", "non_nd_format_ratio", 0.1)) if total_fmt else False:
+            lines.append(f"  - {non_nd}/{total_fmt} ({non_nd/total_fmt*100:.0f}%) 非 ND input format — layout 转换开销。op_statistic 的 Transpose/Cast 聚合可确认占比")
+    if cube_total_count > 0:
+        avg_cube = cube_util_wsum / cube_util_dur_sum
+        lines.append(f"  Cube 利用率: avg={avg_cube:.1f}%, min={cube_util_min:.1f}%, "
+                     f"low(<50%)={cube_low_util_count}/{cube_total_count}")
     if aic_kernels == 0 and aiv_kernels == 0:
         lines.append("  [!] 所有 ratio 均为 0 — 请检查采集时是否使用 aic_metrics=PipeUtilization")
     lines.append("")
 
-    # --- 3. AI CPU Fallback [DEFINITE] ---
-    if aicpu_kernels:
-        lines.append("## 3. AI CPU Fallback（非 comm）[DEFINITE]")
-        lines.append("  运行在 AI CPU 上的非 communication 算子（无 AI Core 实现）。排除 communication 算子 — 它们按设计运行在 AI CPU 上。")
-        aicpu_total = sum(d for d, _, _, _ in aicpu_kernels)
-        lines.append(f"  数量: {len(aicpu_kernels)}  |  总计: {aicpu_total/1000:.1f}ms")
-        aicpu_sorted = sorted(aicpu_kernels, key=lambda x: -x[0])
-        lines.append(f"  {'Name':<35} {'Dur(us)':>8} {'Type':<15} {'Shapes'}")
-        lines.append(f"  {'-'*35} {'-'*8} {'-'*15} {'-'*20}")
-        for dur, name, otype, shapes in aicpu_sorted[:top_k]:
-            shapes_clean = shapes.replace("\n", " ").replace(";", "|").replace('"', '')[:30]
-            lines.append(f"  {name:<35} {dur:>8.1f} {otype:<15} {shapes_clean}")
-        lines.append("")
-
-    # --- 4. Kernel Duration 分布 ---
-    sec_num = 4 if aicpu_kernels else 3
+    # --- 3. Kernel Duration 分布 ---
+    sec_num = 3
     lines.append(f"## {sec_num}. Kernel Duration 分布")
+    dur_counted = sum(dur_buckets.values())
     for bucket, count in dur_buckets.items():
-        pct = count / total_rows * 100 if total_rows > 0 else 0
+        pct = count / dur_counted * 100 if dur_counted > 0 else 0
         bar = "█" * int(pct / 3)
         lines.append(f"  {bucket:>8}: {count:>6} ({pct:>5.1f}%) {bar}")
-    short_ratio = (dur_buckets["<5us"] + dur_buckets["5-20us"]) / total_rows * 100 if total_rows > 0 else 0
+    short_ratio = (dur_buckets["<5us"] + dur_buckets["5-20us"]) / dur_counted * 100 if dur_counted > 0 else 0
     lines.append(f"  短 kernel 占比 (<20us): {short_ratio:.1f}%")
     if short_ratio > threshold("kernel_details", "short_kernel_dominant", 60):
-        lines.append(f"  - 多数 kernel 非常短。减少 op 数量可能比优化单个 op 收益更大")
-        lines.append(f"    交叉验证: op_statistic 的 fragmentation signal 部分，trace_view 的 dispatch latency 部分")
+        lines.append(f"  - 多数 kernel 非常短。减少 op 数量可能比优化单个 op 收益更大。op_statistic 的 fragmentation signal + trace_view 的 dispatch latency 可交叉确认")
     lines.append("")
 
     sec_num += 1
@@ -383,14 +360,17 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
 
     # --- 5. Block Dim 分布 ---
     sec_num += 1
-    lines.append(f"## {sec_num}. Block Dim 分布（并行度）")
-    for bucket, count in block_dim_buckets.items():
-        pct = count / total_rows * 100 if total_rows > 0 else 0
-        bar = "█" * int(pct / 3)
-        lines.append(f"  Dim {bucket:>5}: {count:>6} ({pct:>5.1f}%) {bar}")
-    low_par = block_dim_buckets["1"]
-    if low_par / total_rows > threshold("kernel_details", "low_parallelism_ratio", 0.1):
-        lines.append(f"  - {low_par} 个 kernel 的 Block Dim=1: shape 可能太小，无法并行")
+    lines.append(f"## {sec_num}. Block Dim 分布（并行度，duration 加权）")
+    if block_dim_total_dur > 0:
+        for bucket, dur_sum in block_dim_dur.items():
+            pct = dur_sum / block_dim_total_dur * 100
+            bar = "█" * int(pct / 3)
+            lines.append(f"  Dim {bucket:>5}: {dur_sum/1000:>8.1f}ms ({pct:>5.1f}%) {bar}")
+        low_par_ratio = block_dim_dur["1"] / block_dim_total_dur
+        if low_par_ratio > threshold("kernel_details", "low_parallelism_ratio", 0.1):
+            lines.append(f"  - Block Dim=1 占 {low_par_ratio*100:.1f}% 计算时间: shape 可能太小，无法并行")
+    else:
+        lines.append("  无 AI_CORE/AI_VECTOR_CORE kernel")
     lines.append("")
 
     # --- 6. Wait Time 分布（事实陈述）---
@@ -403,9 +383,10 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     all_waits = [k["wait"] for k in all_kernels]
     if all_waits and len(all_waits) > 20:
         avg_wait = sum(all_waits) / len(all_waits)
-        high_wait_count = sum(1 for w in all_waits if w > avg_wait * 0.5)
-        if high_wait_count / len(all_waits) > 0.7 and avg_wait > 100:
-            lines.append(f"  [SIGNAL] Wait time 普遍偏高 (avg={avg_wait:.0f}us, {high_wait_count}/{len(all_waits)} >50% of avg)")
+        sorted_waits = sorted(all_waits)
+        median_wait = sorted_waits[len(sorted_waits) // 2]
+        if median_wait > threshold("kernel_details", "median_wait_threshold_us", 100):
+            lines.append(f"  [SIGNAL] Wait time 普遍偏高 (avg={avg_wait:.0f}us, median={median_wait:.0f}us)")
     lines.append("")
 
     # --- 7. 可疑信号（诊断）---
@@ -444,7 +425,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # 7b. 高 wait 上下文
     high_wait_indices = [i for i, k in enumerate(all_kernels) if k["wait"] > wait_threshold]
     if high_wait_indices:
-        lines.append(f"  [SIGNAL] 高 wait kernel (wait > {wait_threshold:.0f}us) — 交叉验证: 在 trace_view 中查找原因")
+        lines.append(f"  [SIGNAL] 高 wait kernel (wait > {wait_threshold:.0f}us) — 在 trace_view 中查找原因")
         lines.append("")
         top_waits = sorted(high_wait_indices, key=lambda i: -all_kernels[i]["wait"])[:min(top_k, 8)]
         for rank_idx, idx in enumerate(top_waits, 1):
@@ -472,7 +453,6 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
         lines.append(f"    Fusible 序列总耗时: {total_fusible/1000:.2f}ms ({total_fusible/total_dur_us*100:.1f}% 占 compute)")
         lines.append(f"    按累计耗时排序的 Top {min(top_k, 5)}:")
         for total, count, start_idx, types, s in fusible_sorted[:5]:
-            from collections import Counter
             tc = Counter(types).most_common(3)
             type_str = ", ".join(f"{t}:{c}" for t, c in tc)
             lines.append(f"      {total/1000:.2f}ms  {count} 个 kernel  at #{start_idx}  stream={s}  类型: {type_str}")
@@ -497,15 +477,17 @@ def parse_filtered(profiling_dir: str, filters: list, rank=None, top_k: int = 15
     filter_lower = [f.lower() for f in filters]
 
     matched = []
-    all_seq = []  # (index_in_file, is_matched, name, type, dur, wait)
+    all_seq = []  # (index_in_file, is_matched, name, type, dur, wait, start, stream)
     idx = 0
     for row in stream_csv(csv_path):
         name = row.get("Name", "")
         op_type = row.get("Type", "")
         dur = safe_float(row.get("Duration(us)", 0))
         wait = safe_float(row.get("Wait Time(us)", 0))
+        start_ts = safe_float(row.get("Start Time(us)", 0))
+        stream_id = row.get("Stream ID", "?").strip()
         is_match = any(f in name.lower() or f in op_type.lower() for f in filter_lower)
-        all_seq.append((idx, is_match, name, op_type, dur, wait))
+        all_seq.append((idx, is_match, name, op_type, dur, wait, start_ts, stream_id))
         if is_match:
             matched.append(row)
         idx += 1
@@ -581,8 +563,9 @@ def parse_filtered(profiling_dir: str, filters: list, rank=None, top_k: int = 15
             mte1 = safe_float(r.get("aic_mte1_ratio", 0))
             mte2 = safe_float(r.get("aic_mte2_ratio", 0))
             scalar = safe_float(r.get("aic_scalar_ratio", 0))
+            fixpipe = safe_float(r.get("aic_fixpipe_ratio", 0))
             cube = safe_float(r.get("cube_utilization(%)", 0))
-            lines.append(f"      AI_CORE: mac={mac:.3f} mte1={mte1:.3f} mte2={mte2:.3f} scalar={scalar:.3f} cube={cube:.1f}%")
+            lines.append(f"      AI_CORE: mac={mac:.3f} mte1={mte1:.3f} mte2={mte2:.3f} scalar={scalar:.3f} fixpipe={fixpipe:.3f} cube={cube:.1f}%")
         elif core == "AI_VECTOR_CORE":
             vec = safe_float(r.get("aiv_vec_ratio", 0))
             mte2 = safe_float(r.get("aiv_mte2_ratio", 0))
@@ -602,24 +585,34 @@ def parse_filtered(profiling_dir: str, filters: list, rank=None, top_k: int = 15
 
     # 在完整序列中找到匹配 kernel 的位置以展示邻居
     high_wait_matched = []
-    for seq_idx, (file_idx, is_match, name, op_type, dur, wait) in enumerate(all_seq):
-        if is_match and wait > avg_wait * 3 and wait > 200:
-            high_wait_matched.append((wait, seq_idx))
+    for seq_idx, (file_idx, is_match, name, op_type, dur, wait, start_ts, stream_id) in enumerate(all_seq):
+        if is_match and wait > avg_wait * threshold("kernel_details", "filter_high_wait_multiplier", 3) and wait > threshold("kernel_details", "filter_high_wait_min_us", 200):
+            high_wait_matched.append((wait, seq_idx, stream_id))
     high_wait_matched.sort(key=lambda x: -x[0])
 
     if high_wait_matched:
-        lines.append(f"  wait > 3 倍均值 ({avg_wait*3:.0f}us) 的实例，展示邻居:")
+        # 按 stream 分组并按 start time 排序，用于时间邻居查找
+        pf_stream_order = defaultdict(list)
+        for si, entry in enumerate(all_seq):
+            pf_stream_order[entry[7]].append(si)
+        for s in pf_stream_order:
+            pf_stream_order[s].sort(key=lambda si: all_seq[si][6])
+        lines.append(f"  wait > 3 倍均值 ({avg_wait*3:.0f}us) 的实例，展示同 stream 时间邻居:")
         lines.append("")
-        for rank_idx, (wait_val, seq_idx) in enumerate(high_wait_matched[:min(8, top_k)], 1):
-            lines.append(f"  [{rank_idx}] wait={format_duration_ms(wait_val)} 位于位置 #{seq_idx}")
+        for rank_idx, (wait_val, seq_idx, stream_id) in enumerate(high_wait_matched[:min(8, top_k)], 1):
+            lines.append(f"  [{rank_idx}] wait={format_duration_ms(wait_val)} 位于位置 #{seq_idx}  stream={stream_id}")
+            s_order = pf_stream_order.get(stream_id, [])
+            pos = s_order.index(seq_idx) if seq_idx in s_order else -1
             context = 3
-            start = max(0, seq_idx - context)
-            end = min(len(all_seq), seq_idx + context + 1)
-            for i in range(start, end):
-                _, is_m, n, t, d, w = all_seq[i]
-                marker = " <<<" if i == seq_idx else ""
-                match_tag = "*" if is_m else " "
-                lines.append(f"      {match_tag}[{i}] {t:<20} dur={d:>7.1f}us  wait={w:>7.0f}us{marker}")
+            if pos >= 0:
+                lo = max(0, pos - context)
+                hi = min(len(s_order), pos + context + 1)
+                for p in range(lo, hi):
+                    ci = s_order[p]
+                    _, is_m, n, t, d, w = all_seq[ci][:6]
+                    marker = " <<<" if ci == seq_idx else ""
+                    match_tag = "*" if is_m else " "
+                    lines.append(f"      {match_tag}[{ci}] {t:<20} dur={d:>7.1f}us  wait={w:>7.0f}us{marker}")
             lines.append("")
     else:
         lines.append("  没有 wait time 显著偏高的实例。")

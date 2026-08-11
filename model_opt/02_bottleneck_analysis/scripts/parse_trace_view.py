@@ -174,7 +174,9 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
     last_end = {}                          # (pid,tid) -> (end_ns, name) 用于 compute task
     noncompute_count = 0
     _gb = threshold("trace_view", "gap_buckets_us", [10, 50, 200])
-    gap_buckets = {f"<{_gb[0]}us": 0, f"{_gb[0]}-{_gb[1]}us": 0, f"{_gb[1]}-{_gb[2]}us": 0, f">{_gb[2]}us": 0}
+    _gk = [f"<{_gb[0]}us", f"{_gb[0]}-{_gb[1]}us", f"{_gb[1]}-{_gb[2]}us", f">{_gb[2]}us"]
+    gap_buckets = {k: 0 for k in _gk}
+    _compute_types = tuple(threshold("trace_view", "compute_task_types", ["AI_CORE", "AI_VECTOR", "AICORE", "AIVEC", "MIX", "VECTOR"]))
     stall_agg = defaultdict(lambda: [0, 0, 0])  # (prev,cur) -> [count, sum_gap, max_gap]
 
     flow_ts = {}                           # HostToDevice id -> [s_ts, f_ts, dev_name]
@@ -228,7 +230,7 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
         if is_device(e):
             dev_count += 1
             tt = e["args"].get("Task Type", "")
-            compute = any(k in tt for k in threshold("trace_view", "compute_task_types", ["AI_CORE", "AI_VECTOR", "AICORE", "AIVEC", "MIX", "VECTOR"]))
+            compute = any(k in tt for k in _compute_types)
             ts = parse_ts_ns(e.get("ts"))
             dn = dur_ns(e.get("dur"))
             end = ts + dn
@@ -253,13 +255,13 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
                     gap = ts - prev_end
                     if gap > 0:
                         if gap < _gb[0] * 1000:
-                            gap_buckets["<10us"] += 1
+                            gap_buckets[_gk[0]] += 1
                         elif gap < _gb[1] * 1000:
-                            gap_buckets["10-50us"] += 1
+                            gap_buckets[_gk[1]] += 1
                         elif gap < _gb[2] * 1000:
-                            gap_buckets["50-200us"] += 1
+                            gap_buckets[_gk[2]] += 1
                         else:
-                            gap_buckets[">200us"] += 1
+                            gap_buckets[_gk[3]] += 1
                         if gap >= gap_threshold_ns:
                             a = stall_agg[(prev_name, name)]
                             a[0] += 1
@@ -553,8 +555,7 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
             if "Mata Bw" in nm: return "MAC Bw Level"
             if "HBM" in nm or "DDR" in nm: return "Memory Occupancy(KB)"
             return "utilization"
-        from collections import defaultdict as _dd
-        grouped = _dd(lambda: [0, 0.0, None, None])
+        grouped = defaultdict(lambda: [0, 0.0, None, None])
         for nm, st in counters.items():
             c = _cat(nm)
             g = grouped[c]
@@ -577,7 +578,7 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
             L.append(f"  - HBM Read BW peak={hbm_read[3]:.0f} MB/s — 交叉验证 HBM peak BW 以判断内存饱和。")
         llc = grouped.get("LLC Hit Rate(%)")
         if llc and llc[1] / (llc[0] or 1) < 0.5:
-            L.append(f"  - LLC Hit Rate 均值偏低 ({llc[1]/(llc[0] or 1)*100:.0f}%) — cache-unfriendly 的访问模式；交叉验证 kernel_details 的 mte 占比。")
+            L.append(f"  - LLC Hit Rate 均值偏低 ({llc[1]/(llc[0] or 1)*100:.0f}%) — cache-unfriendly 的访问模式。kernel_details 的 mte 占比可交叉确认")
         L.append("")
     else:
         L.append("  未发现 resource 计数器 (HBM bw / LLC / 利用率时间线不可用).")
@@ -674,12 +675,12 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
                 v = idle_attr.get(c, 0)
                 if v > 0:
                     L.append(f"    {c:<12} {format_duration_ms(v/1000)} ({v/sweep_idle*100:>5.1f}%)")
-            L.append(f"    {'residual':<12} {format_duration_ms(residual_idle/1000)} ({residual_idle/sweep_idle*100:>5.1f}%)  (Python framework / 无工作；交叉验证 operator_details host category)")
+            L.append(f"    {'residual':<12} {format_duration_ms(residual_idle/1000)} ({residual_idle/sweep_idle*100:>5.1f}%)  (Python framework / 无工作；operator_details host category 可定位)")
             all_attr = list(idle_attr.items()) + [("residual", residual_idle)]
             dom = max(all_attr, key=lambda x: x[1])
             L.append(f"  - 主导 idle 原因: {dom[0]} ({dom[1]/sweep_idle*100:.0f}% 占 idle)")
             if dom[0] == "mem-mgmt":
-                L.append("    Host 阻塞在 aclrt memory APIs (Free/Unmap/Malloc/Map) - device starves. 交叉验证 api_statistic (memory-mgmt 类别).")
+                L.append("    Host 阻塞在 aclrt memory APIs (Free/Unmap/Malloc/Map) - device starves. api_statistic (memory-mgmt 类别) 可确认。")
             L.append("")
 
     # --- 6. 可疑信号（诊断：compile 分类 + prefetch 候选）---
@@ -700,7 +701,7 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
                  f"在 launch 时立即启动（队列等待 host dispatch）。")
         L.append(f"    最差区域: {len(worst)} 个 op，device idle {widle_pct:.0f}%, "
                  f"chain: {_chain_summary(worst)[:100]}")
-        L.append("    - 完整 chain + call stack 见第 4 节；交叉验证 operator_details / step_trace。")
+        L.append("    - 完整 chain + call stack 见第 4 节；operator_details / step_trace 可交叉确认")
         L.append("")
 
     if acl_compile:
@@ -753,7 +754,7 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
         L.append("    Top GC 事件:")
         for dur, name in gc_sorted[:3]:
             L.append(f"      {format_duration_ms(dur/1000)}  {name[:60]}")
-        L.append("    - 交叉验证: 若 GC 频繁，检查是否存在过多小 tensor 分配 (operator_memory).")
+        L.append("    - 若 GC 频繁，检查是否存在过多小 tensor 分配 (operator_memory 可确认)")
         L.append("")
 
     # Stream synchronization

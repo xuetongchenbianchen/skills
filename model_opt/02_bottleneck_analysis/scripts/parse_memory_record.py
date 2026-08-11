@@ -88,11 +88,21 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
         lines.append("")
 
     # Active 内存（真实活跃集，与含 cache 的 Allocated 不同）
+    bar_width = 30
     if active_records:
         active_values = [a for _, a in active_records]
+        active_ts_list = [ts for ts, _ in active_records]
+        max_active = max(active_values)
+        max_active_idx = active_values.index(max_active)
+        max_active_time = (active_ts_list[max_active_idx] - t0) / 1e6
+        min_active = min(active_values)
         lines.append(f"## 0a. Active 内存（真实活跃集）")
-        lines.append(f"  记录数: {len(active_records):,}  |  Min: {min(active_values):,.0f} MB  |  Max: {max(active_values):,.0f} MB")
+        lines.append(f"  记录数: {len(active_records):,}  |  Min: {min_active:,.0f} MB  |  Max: {max_active:,.0f} MB  (at {max_active_time:.3f}s)")
         lines.append(f"  Active < Allocated = 已缓存但可复用的 headroom。应使用 Active (而非 Allocated) 确定 batch-size 上限。")
+        peak_reserved = max(r[1] for r in reserved_records)
+        waste = peak_reserved - max_active
+        if waste > 0:
+            lines.append(f"  Reserved peak {peak_reserved:,.0f}MB - Active peak {max_active:,.0f}MB = {waste:,.0f}MB 池预留/缓存")
         lines.append("")
 
     # --- 1. Reserved 内存（池大小）---
@@ -117,7 +127,6 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
             idx = min(int((ts - t0) / bucket_width), num_buckets - 1)
             buckets[idx] = max(buckets[idx], mem)
 
-        bar_width = 30
         scale = max_res if max_res > 0 else 1
         for i, bmax in enumerate(buckets):
             t_s = (i * bucket_width) / 1e6
@@ -205,22 +214,48 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
             lines.append(f"    {rel:>9.3f} {delta:>+12,.0f} {mem:>12,.0f}")
     lines.append("")
 
+    # Active 内存跳变（临时 tensor 分配/释放 — "瞬间涨→立刻回落"模式）
+    if active_records and len(active_records) > 1:
+        active_jumps = []
+        for i in range(1, len(active_records)):
+            delta = active_records[i][1] - active_records[i - 1][1]
+            if abs(delta) > 0:
+                active_jumps.append((abs(delta), delta, active_records[i][0], active_records[i][1]))
+        if active_jumps:
+            top_active = heapq.nlargest(min(top_k, 5), active_jumps, key=lambda x: x[0])
+            lines.append(f"  Active 内存跳变 Top {len(top_active)}（临时 tensor 分配/释放）:")
+            for _, delta, ts, mem in top_active:
+                rel = (ts - t0) / 1e6
+                lines.append(f"    {rel:>9.3f}s {delta:>+12,.0f} MB  → {mem:>8,.0f} MB")
+            lines.append("")
+
     # --- 可疑信号 ---
     lines.append("## 可疑信号")
     lines.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，根因未定 — 需结合其他 profiling 维度交叉验证")
     suspects_found = False
 
-    # 增长趋势
+    # 内存泄漏检测：优先用 Active 基线增长（真实泄漏信号），回退到 Reserved（池扩张）
     n_records = len(reserved_records)
-    if n_records > threshold("memory_record", "growth_min_records", 20):
+    if active_records and len(active_records) > threshold("memory_record", "growth_min_records", 20):
+        n_active = len(active_records)
+        early_active = active_values[:n_active // 10]
+        late_active = active_values[-(n_active // 10):]
+        early_active_avg = sum(early_active) / len(early_active)
+        late_active_avg = sum(late_active) / len(late_active)
+        active_growth = late_active_avg - early_active_avg
+        if active_growth > threshold("memory_record", "growth_mb", 100):
+            lines.append(f"  - [SIGNAL] Active 基线增长：早期均值 {early_active_avg:,.0f}MB → 末期均值 {late_active_avg:,.0f}MB (+{active_growth:,.0f}MB)")
+            lines.append(f"    operator_memory 可确认是否有未释放的 tensor 累积")
+            suspects_found = True
+    elif n_records > threshold("memory_record", "growth_min_records", 20):
         early = res_values[:n_records // 10]
         late = res_values[-(n_records // 10):]
         early_avg = sum(early) / len(early)
         late_avg = sum(late) / len(late)
         growth = late_avg - early_avg
         if growth > threshold("memory_record", "growth_mb", 100):
-            lines.append(f"  - [SIGNAL] Reserved 增长趋势：早期均值 {early_avg:,.0f}MB - 末期均值 {late_avg:,.0f}MB (+{growth:,.0f}MB)")
-            lines.append(f"    交叉验证: 检查 operator_memory 是否有未释放的 tensor 累积")
+            lines.append(f"  - [SIGNAL] Reserved 增长趋势：早期均值 {early_avg:,.0f}MB → 末期均值 {late_avg:,.0f}MB (+{growth:,.0f}MB)")
+            lines.append(f"    operator_memory 可确认是否有未释放的 tensor 累积")
             suspects_found = True
 
     # 高 churn
@@ -228,7 +263,7 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
         large_jumps = [j for j in jumps if j[0] > threshold("memory_record", "churn_jump_mb", 50)]
         if len(large_jumps) > threshold("memory_record", "churn_count", 20):
             lines.append(f"  - [SIGNAL] 高内存 churn: {len(large_jumps)} 次跳变 > 50MB")
-            lines.append(f"    交叉验证: 在 operator_memory 中查找重复的等大小 alloc - buffer 复用机会")
+            lines.append(f"    operator_memory 中查找重复的等大小 alloc — buffer 复用机会")
             suspects_found = True
 
     # Fragmentation 随时间增长

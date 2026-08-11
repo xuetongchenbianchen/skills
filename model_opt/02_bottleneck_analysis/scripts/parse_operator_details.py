@@ -62,46 +62,44 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
     total_rows = 0
     total_host_us = 0.0
     total_device_us = 0.0
-    total_host_total_us = 0.0  # inclusive host (self + children)
 
     # 按算子名聚合：聚焦 host 时间
     op_agg = defaultdict(lambda: {"count": 0, "host_us": 0.0, "device_us": 0.0,
-                                   "device_total": 0.0, "device_aicpu": 0.0})
+                                   "device_total": 0.0, "device_aicore": 0.0})
 
     # 按 category 拆解 host 时间 (C1): sync / alloc / H2D-copy / dispatch / framework / other
     cat_agg = defaultdict(float)
-    # Layer 归因 (B4/C6): 按首个 project call-stack frame 的 inclusive Host Total
-    layer_agg = defaultdict(lambda: {"host_total": 0.0, "count": 0})
-    _LIB_MARKERS = ("site-packages", "dist-packages", "/lib/python", "torch/nn/modules",
-                    "torch/_ops", "autograd/profiler", "torch_npu/profiler")
+    # Layer 归因 (B4/C6): 按首个 project call-stack frame 的 Host Self 归因
+    layer_agg = defaultdict(lambda: {"host_us": 0.0, "count": 0})
+    _LIB_MARKERS = tuple(threshold("trace_view", "stack_lib_markers",
+                         ["site-packages", "dist-packages", "/lib/python",
+                          "torch/nn/modules", "torch/_ops", "autograd/profiler", "torch_npu/profiler"]))
 
     for row in stream_csv(csv_path):
         total_rows += 1
         host_dur = safe_float(row.get("Host Self Duration(us)", 0))
         device_dur = safe_float(row.get("Device Self Duration(us)", 0))
-        host_total = safe_float(row.get("Host Total Duration(us)", 0))
         device_total = safe_float(row.get("Device Total Duration(us)", 0))
-        device_aicpu = safe_float(row.get("Device Self Duration With AICore(us)", 0))
+        device_aicore = safe_float(row.get("Device Self Duration With AICore(us)", 0))
         total_host_us += host_dur
         total_device_us += device_dur
-        total_host_total_us += host_total
 
         name = row.get("Name", "?")
         op_agg[name]["count"] += 1
         op_agg[name]["host_us"] += host_dur
         op_agg[name]["device_us"] += device_dur
         op_agg[name]["device_total"] += device_total
-        op_agg[name]["device_aicpu"] += device_aicpu
+        op_agg[name]["device_aicore"] += device_aicore
 
         # C1: 按算子名的 host category
         cat_agg[_host_category(name)] += host_dur
 
-        # B4/C6: 通过首个 project frame 进行 layer 归因（inclusive Host Total）
+        # B4/C6: 通过首个 project frame 进行 layer 归因（Host Self，无重复计数）
         frames = _parse_call_stack(row.get("Call Stack", ""))
         proj_frame = next((f for f in frames if not any(m in f for m in _LIB_MARKERS)), None)
         if proj_frame:
             key = proj_frame[:90]
-            layer_agg[key]["host_total"] += host_total if host_total > 0 else host_dur
+            layer_agg[key]["host_us"] += host_dur
             layer_agg[key]["count"] += 1
 
     if total_rows == 0:
@@ -161,7 +159,7 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
             pct = us / total_host_us * 100
             lines.append(f"  {cat:<28} {us/1000:>9.1f} ms  ({pct:>5.1f}%)")
         sync_us = sum(v for k, v in cat_agg.items() if k.startswith("sync"))
-        if sync_us / total_host_us > 0.2:
+        if sync_us / total_host_us > threshold("operator_details", "sync_dominance_pct", 20) / 100:
             lines.append(f"  - sync (D-H) 占主导 ({sync_us/total_host_us*100:.0f}%): 消除 .item()/.numpy()，缓存/延迟 sync")
         # dispatch 合计（CANN 层 + PyTorch 层）
         dispatch_total = sum(v for k, v in cat_agg.items() if k.startswith("dispatch"))
@@ -173,7 +171,7 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
     # 当 other 占比 > 10% 时，列出其中的 Top op，避免 agent 手动从 Top-15 表关联。
     other_us = cat_agg.get("other", 0)
     other_pct = other_us / total_host_us * 100 if total_host_us > 0 else 0
-    if other_pct > 10:
+    if other_pct > threshold("operator_details", "other_breakdown_pct", 10):
         other_ops_agg = {name: info for name, info in op_agg.items()
                          if _host_category(name) == "other"}
         other_sorted = sorted(other_ops_agg.items(), key=lambda x: -x[1]["host_us"])
@@ -193,16 +191,15 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         lines.append("")
 
     # --- Layer 归因 (B4/C6) ---
-    # 按首个 project call-stack frame 的 inclusive Host Total — 供 Line A 使用
+    # 按首个 project call-stack frame 的 Host Self 归因（无重复计数）
     # layer 归因门槛（任何 layer 占 host 时间 >10% 都需有候选）。
     if layer_agg:
-        lines.append("## 按 Call-Chain Layer 拆解 Host 时间 (inclusive Host Total)")
-        lines.append("  每个 layer 的 inclusive host 开销 (Host Total, self+children)。Line A 门槛: layer 占 total >10% - 必须有候选。")
-        layers_sorted = sorted(layer_agg.items(), key=lambda x: -x[1]["host_total"])
-        denom = total_host_total_us if total_host_total_us > 0 else total_host_us
+        lines.append("## 按 Call-Chain Layer 拆解 Host 时间 (Host Self)")
+        lines.append("  每个 layer 的 host self 开销。Line A 门槛: layer 占 total >10% - 必须有候选。")
+        layers_sorted = sorted(layer_agg.items(), key=lambda x: -x[1]["host_us"])
         for frame, info in layers_sorted[:top_k]:
-            pct = info["host_total"] / denom * 100 if denom > 0 else 0
-            lines.append(f"  {pct:>5.1f}%  {info['host_total']/1000:>9.1f} ms  ({info['count']:>5} 个 op)  {frame}")
+            pct = info["host_us"] / total_host_us * 100 if total_host_us > 0 else 0
+            lines.append(f"  {pct:>5.1f}%  {info['host_us']/1000:>9.1f} ms  ({info['count']:>5} 个 op)  {frame}")
         lines.append("")
 
     # 可疑信号
@@ -222,19 +219,19 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         lines.append(f"  - [SIGNAL] host/device 比例极端的 op (host > 10x device, host > 5ms):")
         for name, info in high_ratio[:5]:
             lines.append(f"    {name}: host={info['host_us']/1000:.1f}ms vs device={info['device_us']/1000:.1f}ms")
-        lines.append(f"    交叉验证: 用 --filter <op> 查看 Call Stack 源码位置，用 trace_view 查看 host dispatch 积压")
+        lines.append(f"    用 --filter <op> 查看 Call Stack 源码位置，trace_view 查看 host dispatch 积压")
         suspects_found = True
 
-    # A5: AI_CPU device 归因 — device 时间在 AI_CPU 上的 op（fallback）
+    # A5: AI_CPU fallback — AICore 占比低说明 device 时间大量在 AI_CPU 上
     aicpu_ops = [(name, info) for name, info in op_sorted_host
-                 if info["device_us"] > 0 and info["device_aicpu"] / info["device_us"] > 0.5
-                 and info["device_aicpu"] > 1000]
+                 if info["device_us"] > threshold("operator_details", "aicpu_fallback_min_device_us", 1000) and info["device_aicore"] / info["device_us"] < threshold("operator_details", "aicpu_fallback_aicore_ratio", 0.5)
+                 and info["device_us"] > 0]
     if aicpu_ops:
-        lines.append(f"  - [DEFINITE] device 时间在 AI_CPU 上的 op (>50% 归因 AICore, fallback):")
+        lines.append(f"  - [DEFINITE] AI_CPU fallback (AICore 占比 <50%):")
         for name, info in aicpu_ops[:5]:
-            lines.append(f"    {name}: device={info['device_us']/1000:.1f}ms  aicpu={info['device_aicpu']/1000:.1f}ms "
-                         f"({info['device_aicpu']/info['device_us']*100:.0f}%)")
-        lines.append(f"    - 用 AI Core impl 替换 / 更改 dtype。交叉验证 kernel_details 第 3 节 AI CPU Fallback。")
+            lines.append(f"    {name}: device={info['device_us']/1000:.1f}ms  aicore={info['device_aicore']/1000:.1f}ms "
+                         f"({info['device_aicore']/info['device_us']*100:.0f}% on AICore)")
+        lines.append(f"    - 用 AI Core impl 替换 / 更改 dtype")
         suspects_found = True
 
     if not suspects_found:

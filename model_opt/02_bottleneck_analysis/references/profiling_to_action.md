@@ -22,7 +22,7 @@
 - 设备利用率低 + Free 大 → Host-Bound（host 喂不动设备）
 - 利用率高 + mac 占主导 → Compute-Bound 嫌疑
 - 利用率高 + mte 占主导 → Memory-Bound 嫌疑
-- Communication 占比高 → Comm-Bound 嫌疑
+- Communication(Not Overlapped) 占比高 → Comm-Bound 嫌疑
 - empty_tensor 高频 + Free 大 → Allocator-Bound 嫌疑
 
 瓶颈类型决定归因层往哪个方向查（Host-Bound 查 host 侧浪费、Compute-Bound 查 compute 饱和…）。判定用利用率/硬件占比/通信占比，具体阈值是负载相关默认值（见工具映射层），非普适判据。

@@ -58,8 +58,8 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20,
         name = row.get("Name", "?")
         alloc_total = safe_float(row.get("Allocation Total Allocated(MB)", 0))
 
-        max_alloc_at_alloc = max(max_alloc_at_alloc, alloc_total)
-        if alloc_total >= max_alloc_at_alloc:
+        if alloc_total > max_alloc_at_alloc:
+            max_alloc_at_alloc = alloc_total
             peak_alloc_time = safe_float(row.get("Allocation Time(us)", 0))
 
         # C10: 收集所有 tensor 用于 peak 归因（peak 时刻仍存活）
@@ -234,7 +234,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20,
     if projected_peak_mb / hbm_mb > PARALLELISM_RATIO:
         lines.append(f"  [SIGNAL] 预估 peak ({projected_peak_mb/hbm_mb*100:.0f}% HBM) 在消除浪费后仍超过 {PARALLELISM_RATIO*100:.0f}%。")
         lines.append("    - 可能需要 parallelism。需进行源码分析:")
-        lines.append("      1. 阅读 parallel_design.md 了解拆分原则")
+        lines.append("      1. 阅读 03_optimization/references/parallel_design.md 了解拆分原则")
         lines.append("      2. 用 operator_details 的 Call Stack 在源码中定位大 tensor")
         lines.append("      3. 从计算结构中识别可 shard 的维度")
         lines.append("      4. 拆分后重新 profile 以验证")

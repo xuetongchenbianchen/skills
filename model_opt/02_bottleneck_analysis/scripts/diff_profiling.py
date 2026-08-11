@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (find_ascend_profiler_output, read_csv_all, stream_csv,
-                    safe_float, safe_int)
+                    safe_float, safe_int, threshold)
 
 
 def _load_op_stats(ascend_dir):
@@ -47,19 +47,31 @@ def _get_memory_peak(ascend_dir):
 
 
 def _get_step_info(ascend_dir):
-    """Return (step_count, computing_us, free_us, comm_us, has_operator_details)
-    for normalization + L0/L1 level guard + utilization diff."""
+    """Return (step_count, computing_us, free_us, comm_not_ovl_us, total_us,
+    has_operator_details) for normalization + L0/L1 level guard + utilization diff.
+
+    comm_not_ovl = Communication(Not Overlapped) — pure comm, excludes overlap
+    already counted in Computing.  total derived from Stage+Bubble (authoritative)
+    with fallback to Computing + Comm(Not Overlapped) + Free.
+    """
     step_count = 0
-    computing = free = comm = 0.0
+    computing = free = comm_not_ovl = total = 0.0
     st = ascend_dir / "step_trace_time.csv"
     if st.exists():
         for row in read_csv_all(st):
             step_count += 1
-            computing += safe_float(row.get("Computing", 0))
-            free += safe_float(row.get("Free", 0))
-            comm += safe_float(row.get("Communication", 0))
+            c = safe_float(row.get("Computing", 0))
+            f = safe_float(row.get("Free", 0))
+            cn = safe_float(row.get("Communication(Not Overlapped)", 0))
+            stage = safe_float(row.get("Stage", 0))
+            bubble = safe_float(row.get("Bubble", 0))
+            t = (stage + bubble) if (stage + bubble) > 0 else (c + cn + f)
+            computing += c
+            free += f
+            comm_not_ovl += cn
+            total += t
     has_od = (ascend_dir / "operator_details.csv").exists()  # L1+ has it, L0 doesn't
-    return step_count, computing, free, comm, has_od
+    return step_count, computing, free, comm_not_ovl, total, has_od
 
 
 def _get_host_overview(ascend_dir):
@@ -168,8 +180,8 @@ def parse(dir_before: str, dir_after: str, rank=None, top_k: int = 20) -> str:
     lines.append("")
 
     # Normalization + L0/L1 level guard (D7)
-    sb, comp_b, free_b, comm_b, odb = _get_step_info(ascend_before)
-    sa, comp_a, free_a, comm_a, oda = _get_step_info(ascend_after)
+    sb, comp_b, free_b, comm_b, total_b, odb = _get_step_info(ascend_before)
+    sa, comp_a, free_a, comm_a, total_a, oda = _get_step_info(ascend_after)
     lines.append("## Comparability Guard")
     warn = False
     if odb != oda:
@@ -184,31 +196,32 @@ def parse(dir_before: str, dir_after: str, rank=None, top_k: int = 20) -> str:
 
     # Utilization diff (D1) — the key inference metric "did host-bound improve"
     if sb > 0 and sa > 0:
-        util_b = comp_b / (comp_b + free_b) * 100 if (comp_b + free_b) > 0 else 0
-        util_a = comp_a / (comp_a + free_a) * 100 if (comp_a + free_a) > 0 else 0
+        util_b = comp_b / total_b * 100 if total_b > 0 else 0
+        util_a = comp_a / total_a * 100 if total_a > 0 else 0
         norm = sb  # per-step normalization factor
         lines.append("## Utilization / Free Diff (per-step)")
         lines.append(f"  Utilization: {util_b:.1f}% → {util_a:.1f}% ({util_a-util_b:+.1f}%)")
+        lines.append(f"  Total/step:  {total_b/norm/1000:.1f}ms → {total_a/sa/1000:.1f}ms")
         lines.append(f"  Free/step:   {free_b/norm/1000:.1f}ms → {free_a/sa/1000:.1f}ms")
         lines.append(f"  Computing/step: {comp_b/norm/1000:.1f}ms → {comp_a/sa/1000:.1f}ms")
         if comm_b + comm_a > 0:
-            lines.append(f"  Comm/step:   {comm_b/norm/1000:.1f}ms → {comm_a/sa/1000:.1f}ms")
+            lines.append(f"  Comm(NotOvl)/step: {comm_b/norm/1000:.1f}ms → {comm_a/sa/1000:.1f}ms")
         if util_a <= util_b and (free_b - free_a) < 0:
             lines.append("  WARNING Utilization did not improve despite op time change -- possible bottleneck shift; cross-validate with operator_details / trace_view diff.")
         lines.append("")
 
     # Bottleneck type shift (D5)
     def _bottleneck(util, comm_pct):
-        if util < 50:
+        if util < threshold("step_trace", "moderate_host_bound_util", 50):
             return "Host-Bound"
-        if comm_pct > 20:
+        if comm_pct > threshold("step_trace", "comm_bound_pct", 20):
             return "Comm-Bound"
         return "Device-side (Compute/Memory)"
     if sb > 0 and sa > 0:
-        comm_pct_b = comm_b / (comp_b + free_b + comm_b) * 100 if (comp_b + free_b + comm_b) > 0 else 0
-        comm_pct_a = comm_a / (comp_a + free_a + comm_a) * 100 if (comp_a + free_a + comm_a) > 0 else 0
+        comm_pct_b = comm_b / total_b * 100 if total_b > 0 else 0
+        comm_pct_a = comm_a / total_a * 100 if total_a > 0 else 0
         bb = _bottleneck(util_b, comm_pct_b)
-        ba = _bottleneck(util_a if sa > 0 and (comp_a+free_a)>0 else 0, comm_pct_a)
+        ba = _bottleneck(util_a if sa > 0 and total_a > 0 else 0, comm_pct_a)
         lines.append("## Bottleneck Type Shift (D5)")
         lines.append(f"  Before: {bb}  →  After: {ba}")
         if bb != ba:
@@ -242,8 +255,8 @@ def parse(dir_before: str, dir_after: str, rank=None, top_k: int = 20) -> str:
     lines.append("  [DEFINITE]=actionable as-is  [SIGNAL]=anomaly, cross-validate with other profiling dimensions")
     sig = False
     if sb > 0 and sa > 0:
-        util_b = comp_b / (comp_b + free_b) * 100 if (comp_b + free_b) > 0 else 0
-        util_a = comp_a / (comp_a + free_a) * 100 if (comp_a + free_a) > 0 else 0
+        util_b = comp_b / total_b * 100 if total_b > 0 else 0
+        util_a = comp_a / total_a * 100 if total_a > 0 else 0
         if util_a <= util_b:
             lines.append(f"  [SIGNAL] Utilization did not improve ({util_b:.1f}% -> {util_a:.1f}%) despite op time change -- possible bottleneck shift or pseudo-gain.")
             sig = True

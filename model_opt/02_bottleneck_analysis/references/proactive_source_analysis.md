@@ -35,7 +35,7 @@
 推理调用链从外到内分为多层，每层都可能贡献 host 开销。不要只分析 `forward()`——**每一层**都要量化。
 
 1. 从入口到算子，列出调用链经过的所有层（如 `generate()` → `Module.__call__` → `forward()` → `F.linear` → `aten::matmul`）
-2. 用 `parse_operator_details.py` 的 **Host Time by Call-Chain Layer**（inclusive Host Total，按调用链首个项目帧聚合）量化每层 host 开销占比——注意用 Total（含子调用）而非 Self，因为 wrapper/dispatch 层 Self≈0 但 Total 大
+2. 用 `parse_operator_details.py` 的 **Host Time by Call-Chain Layer**（Host Self，按调用链首个项目帧聚合）量化每层 host 开销占比——使用 Self（无重复计数），各层占比之和 = 总 host self 时间
 3. 记录每层占比，供确认节点 A 的优先级覆盖门禁使用（任何层 >10% total host time 须有候选）
 
 > 注意：此步骤只做**量化记录**，不在此处提出方案。某层占比高意味着该层有优化空间，具体怎么改是 Phase 3 的工作。
@@ -74,7 +74,7 @@
 > 以上三层均用于**发现问题**,不展开具体变换方案。等价变换是否成立、数据布局怎么重组,是 Phase 3 的职责。
 
 ### 四维度驱动提问
-
+Cumul
 通读源码后,对每个计算逻辑块用四维度主动提问。
 
 > **边界**:Phase 2 的四维度用于**发现问题**(问"有没有机会"),不展开"怎么改"。具体实施手段(如何合并、如何预分配、用哪个融合算子)是 Phase 3 的工作,由 03_optimization 的各 reference 承载。这里只需识别出"这里存在去重/复用/掩盖/替换的机会"并量化值不值得做。
