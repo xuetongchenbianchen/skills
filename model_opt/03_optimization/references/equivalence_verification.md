@@ -84,8 +84,8 @@ assert torch.equal(out_run1, out_run2)
 | 不确定(两次运行不一致) | jit_compile 未关 / allow_internal_format 未关 | 修复配置后重跑 |
 | fp16 下偏差大但 fp32 下通过 | 精度累积放大 | 可接受(fp16 本身有此特性)，但需确认是否影响下游任务指标 |
 
-## 与 04_accuracy_assurance 现有流程的关系
+## 与整体流程的关系
 
-- 本协议用于**单次等价替换的即时验证**(Phase 3 中每步改动后)——tensor 级数值对比
-- `04_accuracy_assurance/SKILL.md` 的 Level 2 全量验证(Phase 4)是**累积多步改动后的最终确认**——可能包含下游功能指标
-- 两者不冲突: 等价性验证保证每步 tensor 等价 → Level 2 保证累积无退化且下游功能达标
+- 本协议是 03_optimization 中 **Level 2 替换级**优化的精度验证 gate——每次等价替换后必须通过本协议才能接受该改动
+- 04_accuracy_assurance 的 Level 2 全量验证是累积多步改动后的最终确认（可能包含下游功能指标）
+- 两者不冲突：本协议保证每步 tensor 等价 → 04 Level 2 保证累积无退化且下游功能达标

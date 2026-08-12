@@ -69,7 +69,7 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
 
 **Level 2 — 替换级**（换等价实现 / 融合算子 / 改数据流路径）
 - 至少 1 种实现（框架提供或自定义均可）
-- Level 1 精度验证（代表性样本，快速检查）
+- 精度验证：按 [equivalence_verification.md](references/equivalence_verification.md) 协议执行（代表性样本，确认数值等价）
 - A/B benchmark 对比
 - 记录：实现描述、精度结果、耗时对比、失败原因归类（概念错误 / 框架 overhead / 硬件不友好 / 异步流水线耦合）
 - 如仅有框架实现且失败，须尝试 1 种自定义实现后才可放弃

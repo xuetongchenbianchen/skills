@@ -105,8 +105,8 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 **Phase 3 优化实施**：根据用户确认的优化清单，用四维度（去重、复用、掩盖、替换）框架选择具体手段。每条优化后进行Level 1 快速精度验证。实施完成后，必须回溯 Phase 2 的所有结构化产出（热路径审计表、归因层 10 类浪费、根因追踪发现），逐行验证每个 actionable 条目是否已实施或附依据排除。详见 [execution_protocol.md](references/execution_protocol.md)「Phase 3 → Phase 4 门禁」。**任何未关闭的条目阻止进入 Phase 4。**
 
 **Phase 4 精度验证 + Profiling 确认**：本批（本轮优化阶段）所有优化完成后，**必须依次完成**：
-1. 全量精度验证 —— 与原始 baseline 对比，确认精度无退化
-2. 重新采集 **wall-clock + L0** —— wall-clock 确认真实收益，L0 与基线/上一轮比对确认收益来源（L0 Computing 和 L0 Free 的变化）
+1. 全量精度验证（方法论见 [04_accuracy_assurance](04_accuracy_assurance/SKILL.md)）—— 与原始 baseline 对比，确认精度无退化
+2. 重新采集 **wall-clock + L0**（按 Phase 1 相同方法）—— wall-clock 确认真实收益，L0 与基线/上一轮比对确认收益来源（L0 Computing 和 L0 Free 的变化）
 3. 两项均通过后才可进入提交流程；任一不通过则回退或调整
 
 **★ 确认节点 B**：向用户展示本批总结（优化点、性能收益、精度数据、未采纳方案），询问是否确认提交。用户确认后才执行 git commit。

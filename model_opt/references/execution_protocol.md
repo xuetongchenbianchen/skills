@@ -54,7 +54,7 @@ Line A（源码分析）的产出必须包含以下两项分析结果，且其�
 
 Line B（profiling 分析）的产出必须包含以下内容，且其中的发现必须对应候选：
 
-1. **L0/L1 交叉验证结论**（见 [02_bottleneck_analysis/SKILL.md](../02_bottleneck_analysis/SKILL.md) Line B 流程 step 2，`run_analysis.py` 报告 A 节自动完成）：
+1. **L0/L1 交叉验证结论**（见 [02_bottleneck_analysis/SKILL.md](../02_bottleneck_analysis/SKILL.md) Line B 流程 step 3，`run_analysis.py` 报告 A 节自动完成）：
    - 记录 L0 和 L1 的 Computing%/Free%/Utilization
    - 若 L1 Utilization 显著低于 L0（差 >20pp），标注"profiler 伪影警告"——瓶颈类型判定以 L0 为准，L1 的算子级数据仍然有效但 step_trace 的 host/Free time 不可直接作为瓶颈判据
    - 若 L0 不可用，标注"L1 未交叉验证"后方可继续，但后续判断须谨慎
