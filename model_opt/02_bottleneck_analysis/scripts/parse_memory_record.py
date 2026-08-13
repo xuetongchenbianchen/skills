@@ -118,22 +118,28 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
     lines.append(f"  Range: {max_res - min_res:,.0f} MB")
     lines.append("")
 
-    # Reserved 的分桶时间线
+    # Reserved 的分桶时间线 — 仅当有显著变化时输出
     if num_buckets > 0 and len(reserved_records) > 1:
-        lines.append("  时间线（每桶最大 Reserved）:")
         bucket_width = (t_end - t0) / num_buckets
         buckets = [0.0] * num_buckets
         for ts, mem in reserved_records:
             idx = min(int((ts - t0) / bucket_width), num_buckets - 1)
             buckets[idx] = max(buckets[idx], mem)
 
-        scale = max_res if max_res > 0 else 1
-        for i, bmax in enumerate(buckets):
-            t_s = (i * bucket_width) / 1e6
-            bar_len = int(bmax / scale * bar_width)
-            bar = "█" * bar_len
-            lines.append(f"    {t_s:>7.3f}s {bar:<{bar_width}} {bmax:>8,.0f} MB")
-        lines.append("")
+        # 仅当 range > 10% peak 时输出详细时间线，否则一句话总结
+        res_range = max_res - min_res
+        if res_range > max_res * 0.1 and max_res > 0:
+            lines.append("  时间线（每桶最大 Reserved）:")
+            scale = max_res if max_res > 0 else 1
+            for i, bmax in enumerate(buckets):
+                t_s = (i * bucket_width) / 1e6
+                bar_len = int(bmax / scale * bar_width)
+                bar = "█" * bar_len
+                lines.append(f"    {t_s:>7.3f}s {bar:<{bar_width}} {bmax:>8,.0f} MB")
+            lines.append("")
+        else:
+            lines.append(f"  Reserved 稳定在 ~{max_res:,.0f} MB（变化幅度 < 10%，省略时间线）")
+            lines.append("")
 
     # --- 2. Allocated 内存（实际 tensor 使用）---
     if allocated_records:
@@ -165,25 +171,30 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
             lines.append(f"  - 大 gap ({max_frag:,.0f}MB) 表明存在显著的池 fragmentation 或过度预留")
         lines.append("")
 
-        # 分桶 fragmentation 时间线
+        # 分桶 fragmentation 时间线 — 仅当有显著变化时输出
         if num_buckets > 0 and len(allocated_records) > 1:
             alloc_t0 = allocated_records[0][0]
             alloc_tend = allocated_records[-1][0]
             if alloc_tend > alloc_t0:
-                lines.append("  Fragmentation 时间线（每桶最大 gap）:")
                 bw = (alloc_tend - alloc_t0) / num_buckets
                 frag_buckets = [0.0] * num_buckets
                 for ts, alloc, res in allocated_records:
                     bidx = min(int((ts - alloc_t0) / bw), num_buckets - 1)
                     frag_buckets[bidx] = max(frag_buckets[bidx], res - alloc)
 
-                frag_scale = max_frag if max_frag > 0 else 1
-                for i, fmax in enumerate(frag_buckets):
-                    t_s = (i * bw) / 1e6
-                    bar_len = int(fmax / frag_scale * bar_width) if frag_scale > 0 else 0
-                    bar = "█" * bar_len
-                    lines.append(f"    {t_s:>7.3f}s {bar:<{bar_width}} {fmax:>8,.0f} MB")
-                lines.append("")
+                frag_range = max_frag - min_frag
+                if frag_range > max_frag * 0.1 and max_frag > 0:
+                    lines.append("  Fragmentation 时间线（每桶最大 gap）:")
+                    frag_scale = max_frag if max_frag > 0 else 1
+                    for i, fmax in enumerate(frag_buckets):
+                        t_s = (i * bw) / 1e6
+                        bar_len = int(fmax / frag_scale * bar_width) if frag_scale > 0 else 0
+                        bar = "█" * bar_len
+                        lines.append(f"    {t_s:>7.3f}s {bar:<{bar_width}} {fmax:>8,.0f} MB")
+                    lines.append("")
+                else:
+                    lines.append(f"  Fragmentation 稳定在 ~{avg_frag:,.0f} MB（变化幅度 < 10%，省略时间线）")
+                    lines.append("")
     else:
         lines.append("## 2. Allocated 内存")
         lines.append("  (无 Allocated 数据 — 仅存在 APP 采样行)")
@@ -199,19 +210,42 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
     top_allocs = heapq.nlargest(top_k, (j for j in jumps if j[1] > 0), key=lambda x: x[0])
     top_deallocs = heapq.nlargest(top_k, (j for j in jumps if j[1] < 0), key=lambda x: x[0])
 
-    lines.append(f"## 4. Top {top_k} Reserved 跳变")
+    lines.append(f"## 4. Top Reserved 跳变")
     if top_allocs:
-        lines.append("  最大增长（池扩张）:")
-        header = f"    {'Time(s)':>9} {'Delta(MB)':>12} {'After(MB)':>12}"
-        lines.append(header)
+        # 去重聚合：相同 delta 值的跳变合并为一行
+        from collections import defaultdict as _dd
+        alloc_groups = _dd(lambda: {"count": 0, "first_ts": None, "last_ts": None, "after": 0})
         for _, delta, ts, mem in top_allocs:
-            rel = (ts - t0) / 1e6
-            lines.append(f"    {rel:>9.3f} {delta:>+12,.0f} {mem:>12,.0f}")
+            g = alloc_groups[int(delta)]
+            g["count"] += 1
+            if g["first_ts"] is None:
+                g["first_ts"] = ts
+            g["last_ts"] = ts
+            g["after"] = mem
+        lines.append("  最大增长（池扩张）:")
+        for delta, g in sorted(alloc_groups.items(), key=lambda x: -x[0]):
+            rel_first = (g["first_ts"] - t0) / 1e6
+            if g["count"] == 1:
+                lines.append(f"    +{delta:,} MB x1  @{rel_first:.3f}s  → {g['after']:,.0f} MB")
+            else:
+                rel_last = (g["last_ts"] - t0) / 1e6
+                lines.append(f"    +{delta:,} MB x{g['count']}  @{rel_first:.3f}-{rel_last:.3f}s")
     if top_deallocs:
-        lines.append("  最大减少（池收缩）:")
+        dealloc_groups = _dd(lambda: {"count": 0, "first_ts": None, "last_ts": None})
         for _, delta, ts, mem in top_deallocs:
-            rel = (ts - t0) / 1e6
-            lines.append(f"    {rel:>9.3f} {delta:>+12,.0f} {mem:>12,.0f}")
+            g = dealloc_groups[int(abs(delta))]
+            g["count"] += 1
+            if g["first_ts"] is None:
+                g["first_ts"] = ts
+            g["last_ts"] = ts
+        lines.append("  最大减少（池收缩）:")
+        for delta, g in sorted(dealloc_groups.items(), key=lambda x: -x[0]):
+            rel_first = (g["first_ts"] - t0) / 1e6
+            if g["count"] == 1:
+                lines.append(f"    -{delta:,} MB x1  @{rel_first:.3f}s")
+            else:
+                rel_last = (g["last_ts"] - t0) / 1e6
+                lines.append(f"    -{delta:,} MB x{g['count']}  @{rel_first:.3f}-{rel_last:.3f}s")
     lines.append("")
 
     # Active 内存跳变（临时 tensor 分配/释放 — "瞬间涨→立刻回落"模式）
@@ -231,7 +265,6 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
 
     # --- 可疑信号 ---
     lines.append("## 可疑信号")
-    lines.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，根因未定 — 需结合其他 profiling 维度交叉验证")
     suspects_found = False
 
     # 内存泄漏检测：优先用 Active 基线增长（真实泄漏信号），回退到 Reserved（池扩张）

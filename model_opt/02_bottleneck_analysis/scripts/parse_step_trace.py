@@ -32,12 +32,13 @@ def _row_totals(row):
     bubble = safe_float(row.get("Bubble", 0))
     comm_no_recv = safe_float(row.get("Communication(Not Overlapped and Exclude Receive)", 0))
     preparing = safe_float(row.get("Preparing", 0))
+    step_id = row.get("Step", "")
     total = (stage + bubble) if (stage + bubble) > 0 else (computing + comm_not_ovl + free)
     return {
         "computing": computing, "free": free, "comm_raw": comm_raw,
         "comm_not_ovl": comm_not_ovl, "overlapped": overlapped,
         "stage": stage, "bubble": bubble, "comm_no_recv": comm_no_recv,
-        "preparing": preparing, "total": total,
+        "preparing": preparing, "total": total, "step_id": step_id,
     }
 
 
@@ -113,6 +114,43 @@ def parse(profiling_dir: str, rank=None) -> str:
         lines.append("    fusible small-op 节省  - kernel_details 中 Fusible sequences 部分")
         lines.append("")
 
+    # 通信重叠效率分析
+    if tot["comm_raw"] > 0:
+        lines.append("## 通信重叠效率")
+        overlap_ratio = tot["overlapped"] / tot["comm_raw"] * 100
+        not_ovl_ratio = tot["comm_not_ovl"] / tot["comm_raw"] * 100
+        lines.append(f"  通信总量 (Communication):      {tot['comm_raw']/1000:.1f} ms")
+        lines.append(f"  已重叠 (Overlapped):           {tot['overlapped']/1000:.1f} ms ({overlap_ratio:.1f}%)")
+        lines.append(f"  未重叠 (Not Overlapped):       {tot['comm_not_ovl']/1000:.1f} ms ({not_ovl_ratio:.1f}%)")
+        lines.append(f"  重叠效率: {overlap_ratio:.1f}% (Overlapped / Communication)")
+        if overlap_ratio >= threshold("step_trace", "comm_overlap_excellent", 80):
+            lines.append(f"  通信重叠充分（≥80%），计算与通信并行性良好")
+        elif overlap_ratio >= threshold("step_trace", "comm_overlap_moderate", 50):
+            lines.append(f"  [SIGNAL] 通信重叠中等（{overlap_ratio:.0f}%），仍有 {not_ovl_ratio:.0f}% 通信暴露在关键路径上")
+            lines.append(f"    建议: 增大 micro-batch / gradient accumulation 以提升 compute-comm overlap")
+        else:
+            lines.append(f"  [SIGNAL] 通信重叠不足（{overlap_ratio:.0f}%），大部分通信暴露在关键路径上")
+            lines.append(f"    建议: 增大 micro-batch / 启用 gradient bucketing / 调整 allreduce 触发时机")
+        lines.append("")
+
+    # Stage 独立分析
+    if tot["stage"] > 0 and T > 0:
+        lines.append("## Stage 分析（有效工作时间）")
+        stage_pct = tot["stage"] / T * 100
+        lines.append(f"  Stage 总量:    {tot['stage']/1000:.1f} ms ({stage_pct:.1f}% of Total)")
+        lines.append(f"  Computing:     {tot['computing']/1000:.1f} ms ({tot['computing']/T*100:.1f}% of Total)")
+        stage_non_compute = tot["stage"] - tot["computing"]
+        if stage_non_compute > 0:
+            lines.append(f"  Stage 中非 Computing 部分: {stage_non_compute/1000:.1f} ms ({stage_non_compute/T*100:.1f}%)")
+            lines.append(f"    → 包含已重叠的通信和 Preparing 等，属于 Stage 内的并行开销")
+        if tot["bubble"] > 0:
+            effective_ratio = tot["stage"] / (tot["stage"] + tot["bubble"]) * 100
+            lines.append(f"  流水线有效率: {effective_ratio:.1f}% (Stage / (Stage + Bubble))")
+            if effective_ratio < threshold("step_trace", "pipeline_effective_low", 70):
+                lines.append(f"  [SIGNAL] 流水线有效率偏低（{effective_ratio:.0f}%），Bubble 占比过大")
+                lines.append(f"    建议: 增加 micro-batch 数 / 采用 interleaved 1F1B schedule")
+        lines.append("")
+
     # 流水线 Bubble 分析
     if tot["bubble"] > 0:
         lines.append("## 流水线 Bubble 分析")
@@ -146,7 +184,8 @@ def parse(profiling_dir: str, rank=None) -> str:
         lines.append("  " + "-" * (len(header) - 2))
         for idx, s in enumerate(step_data):
             u = s["computing"] / s["total"] * 100 if s["total"] > 0 else 0
-            parts = [f"{idx:>5}", f"{s['total']/1000:>10.1f}", f"{s['computing']/1000:>10.1f}", f"{s['free']/1000:>10.1f}"]
+            step_label = s["step_id"] if s["step_id"] != "" else str(idx)
+            parts = [f"{step_label:>5}", f"{s['total']/1000:>10.1f}", f"{s['computing']/1000:>10.1f}", f"{s['free']/1000:>10.1f}"]
             if has_comm:
                 parts.append(f"{s['comm_not_ovl']/1000:>10.1f}")
             if has_bubble:
@@ -174,7 +213,6 @@ def parse(profiling_dir: str, rank=None) -> str:
     step_totals_list = [s["total"] for s in step_data]
 
     lines.append("## 可疑信号")
-    lines.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，根因未定 — 需结合其他 profiling 维度交叉验证")
     suspects_found = False
 
     if len(step_data) == 1:

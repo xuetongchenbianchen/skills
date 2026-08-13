@@ -115,7 +115,6 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20,
     lines.append("# Operator Memory 分析")
     lines.append(f"数据来源: {csv_path}")
     lines.append(f"总分配记录数: {total_rows:,}")
-    lines.append(f"Peak Allocated (任意分配点): {max_alloc_at_alloc:,.0f} MB")
     lines.append("")
 
     # --- 1. 按大小排序的 Top 分配 ---
@@ -175,7 +174,6 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20,
 
     # --- 可疑信号 ---
     lines.append("## 可疑信号")
-    lines.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，根因未定 — 需结合其他 profiling 维度交叉验证")
     suspects_found = False
 
     repeated = [(key, count) for key, count in size_op_count.items() if count > REPEATED_COUNT]

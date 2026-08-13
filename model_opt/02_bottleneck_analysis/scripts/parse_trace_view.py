@@ -679,7 +679,9 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
             all_attr = list(idle_attr.items()) + [("residual", residual_idle)]
             dom = max(all_attr, key=lambda x: x[1])
             L.append(f"  - 主导 idle 原因: {dom[0]} ({dom[1]/sweep_idle*100:.0f}% 占 idle)")
-            if dom[0] == "mem-mgmt":
+            if dom[0] == "residual" and dom[1] / sweep_idle > 0.9:
+                L.append("    Python 框架开销主导。详见 E 节 category 拆解定位具体 op。")
+            elif dom[0] == "mem-mgmt":
                 L.append("    Host 阻塞在 aclrt memory APIs (Free/Unmap/Malloc/Map) - device starves. api_statistic (memory-mgmt 类别) 可确认。")
             L.append("")
 
@@ -688,7 +690,6 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
     has_suspects = bool(acl_compile) or bool(host_prefetch) or bool(runs)
     if has_suspects or (caps.get("cpu_op", 0) and has_callstack):
         L.append(f"## {sec_num}. 可疑信号")
-        L.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，需结合其他维度交叉验证")
         L.append("")
 
     if runs:
@@ -726,12 +727,21 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
         L.append("")
 
     if host_prefetch:
+        # 按 call stack 聚合相同来源的 op
+        from collections import defaultdict as _dd
+        prefetch_groups = _dd(lambda: {"count": 0, "total_us": 0.0, "names": set()})
+        for dn, name, cs in host_prefetch:
+            stack_key = " | ".join(condense_stack(cs)[:2]) if cs else "(no stack)"
+            g = prefetch_groups[stack_key]
+            g["count"] += 1
+            g["total_us"] += dn / 1000
+            g["names"].add(name)
         L.append("  [SIGNAL] Prefetch / Prealloc 候选 (H2D copy & alloc ops)")
-        L.append("    这些 op 无需替换算子即可优化 (prefetch / pre-allocate / buffer 复用); Call stack 指向代码位置。")
-        for dn, name, cs in sorted(host_prefetch, key=lambda x: -x[0]):
-            L.append(f"    - {name}  host={dn/1000:.1f}us")
-            for frame in condense_stack(cs):
-                L.append(f"        {frame[:110]}")
+        L.append("    按 call site 聚合:")
+        for stack_key, g in sorted(prefetch_groups.items(), key=lambda x: -x[1]["total_us"]):
+            names_str = ", ".join(sorted(g["names"]))
+            L.append(f"    - {names_str} x{g['count']}  total_host={g['total_us']:.1f}us")
+            L.append(f"        @ {stack_key[:120]}")
         L.append("")
     elif caps.get("cpu_op", 0) and has_callstack and not acl_compile:
         L.append("  未发现显著的 H2D copy 或重复 alloc op (aten::to / copy_ / empty 等).")

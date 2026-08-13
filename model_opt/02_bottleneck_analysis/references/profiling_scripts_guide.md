@@ -46,14 +46,15 @@ python <script>.py <profiling_dir> [--rank N] [--top-k K] [--output file.txt]
 
 1. **Core Type 分布**：按 AI_CORE / AI_VECTOR_CORE / AI_CPU 分组统计调用次数、耗时、占比。若有非通信算子落在 AI_CPU 上，标注 [!] 并指向可疑信号。用于在第一步即发现 AI_CPU fallback，不必等 kernel_details。
 
-2. **算子排名表**（`--top-k` 控制显示数量，默认 30）：按总耗时降序列出各算子类型，每行含调用次数、总耗时、平均单次耗时、占比、累计占比。用于快速看到哪些算子消耗了最多的 device 时间。
+2. **算子排名表**（`--top-k` 控制显示数量，默认 30）：按总耗时降序列出各算子类型，每行含 **Core Type 缩写**（AIC/AIV/MIX/CPU）、调用次数、总耗时、平均单次耗时、**Max/Avg 比值**（执行离散度）、占比、累计占比。
 
 3. **Suspect Signals**（自动生成，基于排名表的统计特征）：
-   - **Top-3 集中度** [DEFINITE]：集中度高（>80%）意味着优化少数几个算子就能获得显著收益；集中度低则需要系统性优化。
-   - **数据搬运开销** [SIGNAL]：Transpose/Cast/Copy 等非计算算子的占比。占比高说明数据布局不匹配或存在不必要的类型转换，应追溯源码消除。
-   - **AI_CPU Fallback** [DEFINITE]：非通信算子运行在 AI_CPU 上（无 AI Core 实现）。fallback 算子是"换实现/改 dtype"靶点。
-   - **高频低耗时算子（fragmentation 信号）** [SIGNAL — 弱信号]：调用次数极多但单次很短。仅表明该算子类型调用频繁，**不保证时间上连续**，不能直接作为融合依据。
-   - **低频高耗时算子（重型算子）** [SIGNAL]：调用少但单次很长，通常是大 shape 算子，可拆分或换更高效实现。
+   - **Top-3 集中度** [DEFINITE]：集中度高（>80%）意味着优化少数几个算子就能获得显著收益。
+   - **数据搬运开销** [SIGNAL]：Transpose/Cast/Copy 等非计算算子的占比。
+   - **Core placement 异常** [SIGNAL]：compute 类算子（MatMul/Conv 等）跑在 AI_VECTOR_CORE 上——可能 shape 不满足 AI_CORE 要求或缺少实现。
+   - **执行离散度异常** [SIGNAL]：Max/Avg > 5x 且总占比 > 1% 的算子，部分调用远慢于平均（特定 shape 或冷启动）。
+   - **高频低耗时算子（fragmentation 信号）** [SIGNAL — 弱信号]：调用次数极多但单次很短，加了**总量门控**（总占比 < 1% 不报）。
+   - **低频高耗时算子（重型算子）** [SIGNAL]：调用少但单次很长。
 
 **何时使用**：每次拿到新 profiling 后首先运行，快速定位瓶颈类型。
 
@@ -69,7 +70,7 @@ python parse_op_statistic.py /path/to/profiling --top-k 30
 
 **定位**：host dispatch 开销的 **CANN API 层**视角。回答"host 时间里多少是 tiling、多少是 launch、多少是 memory-mgmt、多少是 sync、多少是 workspace 计算、多少是 JIT 编译"。
 
-**输出**：按 Level（acl/communication/node）汇总 + acl 层 Top API + **类别分解**（memory-mgmt / sync / compile / workspace / tiling / launch）并标 dominant 类别 + host 侧预计算小计（tiling + GetWorkspaceSize 合计）。
+**输出**：按 Level（acl/communication/node）汇总 + acl 层 Top API + **类别分解**（memory-mgmt / sync / compile / workspace / tiling / launch / other）——当 other > 50% 时改为输出 Top 5 API（类别分布此时无信息量）；标 dominant 类别 + host 侧预计算小计（tiling + GetWorkspaceSize 合计）。
 
 **何时使用**：host-bound 时下钻 host 开销的 CANN API 成因（如 launch 次数过多、GetWorkspaceSize 反复计算、aclopCompileAndExecute JIT 编译、aclrtSynchronizeStream 同步阻塞）。
 
@@ -123,24 +124,31 @@ python parse_step_trace.py /path/to/profiling
 
 **输出包含以下维度**：
 
-1. **加速核分布**：AI_CORE vs AI_VECTOR_CORE 的 kernel 数和耗时占比，了解模型计算主要落在 cube 核还是 vector 核上。
-
-2. **硬件单元利用率**（duration 加权 — 按 kernel 执行时间加权，反映时间真实分布）：
-   - AI_CORE：mac_ratio（计算）vs mte1/mte2_ratio（搬运）vs **fixpipe_ratio**（量化/定点），判断 kernel 群整体是 compute-dominated 还是 memory-dominated
+1. **硬件单元利用率**（duration 加权 — 按 kernel 执行时间加权，反映时间真实分布）：
+   - AI_CORE：mac_ratio（计算）vs mte1/mte2_ratio（搬运）vs **fixpipe_ratio**，判断 kernel 群整体是 compute-dominated 还是 memory-dominated
    - AI_VECTOR_CORE：vec_ratio vs mte2/mte3
-   - **icache miss rate**（AI_CORE/AI_VECTOR_CORE 各列）：指令 cache 压力，miss 高 = kernel 调度效率低
+   - **icache miss rate**：指令 cache 压力
    - Cube utilization 的 duration 加权平均值、最小值和低利用率 kernel 数量
-   - **Input Formats 分布**：ND vs NCL/NCHW/NCDHW 等，非 ND 格式占比高 = layout 转换成本（数据布局优化信号）
+   - **Input Formats 分布**：非 ND 格式占比高 = layout 转换成本
 
-3. **Kernel Duration 分布**：按耗时分桶（<5/5-20/20-50/50-200/>200us），短 kernel 占比高 = 碎片化/融合机会。
-4. **小算子识别**（`--small-threshold` 控制，默认 5us）：duration 小于阈值的 kernel 数量、累计时间、Type 分布。大量小算子是碎片化信号，可能存在融合机会。
+2. **Kernel Duration 分布**：按耗时分桶，短 kernel 占比高 = 碎片化/融合机会。
+3. **小算子识别**（`--small-threshold` 控制，默认 5us）。
 
-5. **Block Dim 分布**：按 AI_CORE/AI_VECTOR_CORE kernel 的 Block Dim 分桶（1/2-8/9-28/29+），duration 加权。大量时间花在 Block Dim=1 的 kernel 上说明 shape 太小导致硬件并行利用不足。
+4. **Block Dim 分布**：按并行度分桶，duration 加权。
 
-6. **Suspect Kernels**：duration 高但硬件计算单元占比（mac/vec）极低的 kernel 列表，覆盖 AI_CORE 和 AI_VECTOR_CORE。列出嫌疑，不做判定——可能是 shape 导致的必然结果，也可能有优化空间，由 agent 决定是否用 `--filter` 深入。
+5. **Wait Time 分布**：wait time 分桶 + 普遍偏高检测。
 
-7. **Wait Time 分布 + 高等待上下文**：wait time 的分桶统计，以及 wait 超过阈值的 kernel 及其**同流时间邻居**（按 Start Time 排序，非文件行序），用于识别流水断裂点的原因。
-8. **Suspect Signals**：低利用率高耗时 kernel（融合/换实现靶点）、**真 compute-bound**（高耗时高 mac_ratio，替换/量化/拆分靶点）、可融合小算子序列（**按流分组**检测，跨流不会误报为可融合）。
+6. **Suspect Signals**：
+   - 低 compute ratio kernel（附 **Bottleneck 归因列**：mte/scalar/pipeline-bubble，直接指向优化方向）
+   - 真 compute-bound kernel（高 mac_ratio，替换/量化目标）
+   - 高 wait kernel（**按模式聚合**，附一个示例上下文）
+   - 可融合小算子序列（按流分组检测）
+
+7. **Per-Op-Type 硬件效率**：按 op type 聚合 weighted-avg 的 compute/memory/scalar ratio，标注主导瓶颈。
+
+8. **Data Types 信号**：FP32 占比高时提示混合精度机会。
+
+9. **低并行度慢 Kernel 信号**：Block Dim ≤ 8 且 duration > 50us，总贡献 > 5% 时报告。
 
 **何时使用**：
 - 需要判断 kernel 群整体是 compute-bound 还是 memory-bound 时
@@ -172,10 +180,10 @@ python parse_kernel_details.py /path/to/profiling --filter Transpose Softmax --t
 
 0. **Peak Reserved by Component**：按 Component 分段（WORKSPACE = 算子 workspace，可经 tiling/env 控制；APP/PTA = tensor 内存），区分可控部分。
 0a. **Active Memory（真实活集）**：Total Active 的 min/max + **峰值时间戳**（用于交叉查 operator_memory 定位峰值元凶）。Reserved peak - Active peak = 池预留/缓存浪费量。
-1. **Reserved Memory（allocator 池大小）**：min/max/range + 分桶时间线。
+1. **Reserved Memory（allocator 池大小）**：min/max/range + 分桶时间线（**仅当变化幅度 > 10% peak 时输出**，否则一句话总结）。
 2. **Allocated Memory（实际张量占用）**：仅 PTA 行有此数据，展示实际使用量的 min/max/range。
-3. **Pool Fragmentation（Reserved - Allocated）**：空闲池大小的变化趋势，碎片化程度。
-4. **Top-K Reserved Jumps + Active 跳变**：最大的池增长/收缩跳变 + Active 内存跳变（临时 tensor 分配/释放——"瞬间涨→立刻回落"模式）。
+3. **Pool Fragmentation（Reserved - Allocated）**：空闲池大小的变化趋势（同样条件输出时间线）。
+4. **Top Reserved Jumps + Active 跳变**：最大的池增长/收缩跳变（**相同 delta 值聚合为一行**，展示次数和时间范围）+ Active 内存跳变。
 5. **Suspect Signals**：
    - Active 基线增长：早期 vs 末期 Active 均值递增 = 内存泄漏（无 Active 数据时回退到 Reserved 增长）
    - 高频抖动：大量 >50MB 的跳变（频繁大块分配释放）
@@ -201,11 +209,12 @@ python parse_memory_record.py /path/to/profiling --buckets 20 --top-k 10
 **两种模式**：
 
 1. **默认模式**（轻量 host 开销概览）：
-   - 按 host time 排序的算子列表（不重复 device 分析，那是 kernel_details 的事）
-   - 纯 host 操作占比（框架 dispatch 开销量化）
-   - **Host Time by Category**：把 host Self 时间按类别分解（sync D→H / H2D-copy / alloc-metadata / dispatch / framework / other）——sync 与 dispatch 优化方向相反，分解后定方向
-   - **Host Time by Call-Chain Layer**：按调用链首个项目帧聚合 Host Self（无重复计数）——喂饱 Line A「穿透层级量化」门禁（任何层 >10% host time 须有候选）
-   - Suspect Signals：纯 host 操作占比过高、host/device ratio 极端的算子、**AI_CPU fallback**（Device Self Duration With AICore 占比低 = device 时间大量在 AI_CPU 上，替换/换 dtype 靶点）
+   - 按 host time 排序的算子表（含 **Pure ✓ 标记**区分有无 device 工作的 op）
+   - **纯 Host Op 分类**：metadata op（Device Total = 0，编译可自动消除）vs dispatch wrapper（Device Self = 0 但 Device Total > 0，正常调用层次）
+   - **Host Time by Category**：把 host Self 时间按类别分解（sync D→H / H2D-copy / alloc-metadata / dispatch / other）
+   - **Host-Total 路径（编译粒度参考）**：按 Host Total Duration 排序，展示 Self/Total 比例低的 op——编译该 op 可一次性消除所有子 op dispatch
+   - **Host Time by Call-Chain Layer**：按调用链首个项目帧聚合 Host Self
+   - Suspect Signals：纯 host 操作占比过高、host/device ratio 极端的算子
 
 2. **Filter 模式**（`--filter`，核心用法）：
    - 给定算子名，输出该算子所有调用的 Call Stack，按调用位置分组
@@ -276,7 +285,7 @@ python parse_operator_memory.py /path/to/profiling --top-k 20
 5. **Resource Utilization Timeline (counters)**：聚合 counter 事件——per-die HBM Read/Write 带宽、LLC Hit Rate/Throughput、L2/MAC Bw Level、内存占用、AI Core 频率。带宽/cache 命中率时间线是动态判 memory-bound vs compute-bound、定位带宽饱和时刻的依据
 5b. **Stream Concurrency (掩盖维度)**：扫描所有 compute 流的 kernel 区间，统计"同时有 0/1/2+ 流 busy"的时间占比。四维度里"掩盖/重叠"的唯一量化产出——是否有多流并行可挖
 5c. **Idle 成因分解**：联合扫描 device-busy 与 host `AscendCL@` 事件区间，当 device idle 时归因到 host 此刻在做的事（mem-mgmt / sync / compile / launch / residual）。回答"为什么 device idle"——host-bound 的根因定位
-6. **Suspect Signals**：host2device-bound 摘要（[SIGNAL] 概述区段数/host-bound 算子数/最差区段链，引向 §4 看详情）、在线编译分类（**A 类**集中预热期 → `skip_first` 跳过；**B 类**贯穿全程 → 关 jit_compile / 定 shape / 图编译）、预取/预分配候选（`aten::to`/`copy_`/`empty` 等**不换算子**的优化点，附精简 Call stack）、AI Core 降频、Python GC、频繁 stream 同步
+6. **Suspect Signals**：host2device-bound 摘要（[SIGNAL] 概述区段数/host-bound 算子数/最差区段链，引向 §4 看详情）、在线编译分类（**A 类**集中预热期 → `skip_first` 跳过；**B 类**贯穿全程 → 关 jit_compile / 定 shape / 图编译）、预取/预分配候选（`aten::to`/`copy_`/`empty` 等**不换算子**的优化点，**按 call site 聚合**输出）、AI Core 降频、Python GC、频繁 stream 同步
 
 **Filter 模式**（`--filter NAME`）：给定算子名，输出匹配事件的 Call stack 和 Input Dims，直接定位源码位置。
 
@@ -348,6 +357,7 @@ python diff_profiling.py /path/to/before /path/to/after --top-k 20
 
 ## 注意事项
 
+- `run_analysis.py` 生成的报告以**数值概览**开头（时间分解 + L0/L1 对比），信号标记说明（`[DEFINITE]`/`[SIGNAL]`）在此声明一次，各节不重复
 - 所有脚本都输出 **Suspect Signals** 部分——列出有疑点的数据，不做最终判定，由 agent 决定是否深入
 - 脚本只负责**数据提取和压缩**，不做优化决策——决策由 agent 结合源码分析完成
 - Call Stack 不做任何过滤，保证信息完整性

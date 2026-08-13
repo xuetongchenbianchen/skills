@@ -65,7 +65,8 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
 
     # 按算子名聚合：聚焦 host 时间
     op_agg = defaultdict(lambda: {"count": 0, "host_us": 0.0, "device_us": 0.0,
-                                   "device_total": 0.0, "device_aicore": 0.0})
+                                   "device_total": 0.0, "device_aicore": 0.0,
+                                   "host_total_us": 0.0})
 
     # 按 category 拆解 host 时间 (C1): sync / alloc / H2D-copy / dispatch / framework / other
     cat_agg = defaultdict(float)
@@ -78,6 +79,7 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
     for row in stream_csv(csv_path):
         total_rows += 1
         host_dur = safe_float(row.get("Host Self Duration(us)", 0))
+        host_total = safe_float(row.get("Host Total Duration(us)", 0))
         device_dur = safe_float(row.get("Device Self Duration(us)", 0))
         device_total = safe_float(row.get("Device Total Duration(us)", 0))
         device_aicore = safe_float(row.get("Device Self Duration With AICore(us)", 0))
@@ -87,6 +89,7 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         name = row.get("Name", "?")
         op_agg[name]["count"] += 1
         op_agg[name]["host_us"] += host_dur
+        op_agg[name]["host_total_us"] += host_total
         op_agg[name]["device_us"] += device_dur
         op_agg[name]["device_total"] += device_total
         op_agg[name]["device_aicore"] += device_aicore
@@ -110,43 +113,46 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
     lines.append(f"数据来源: {csv_path}")
     lines.append(f"总行数: {total_rows:,}")
     lines.append(f"总 host 时间: {total_host_us/1000:.1f} ms")
-    lines.append(f"Device 总耗时: {total_device_us/1000:.1f} ms")
     lines.append(f"Host/Device 比例: {total_host_us/total_device_us:.1f}x" if total_device_us > 0 else "")
     lines.append("")
 
-    # 按 HOST 时间排序的 Top op（此处独有）
+    # 按 HOST 时间排序的 Top op（此处独有）— 标注纯 host op
     lines.append(f"## Top {top_k} 个 op (按 Host Self Duration)")
     lines.append("  (聚焦 host 侧 overhead — device 时间分析请用 kernel_details)")
     lines.append("")
     op_sorted_host = sorted(op_agg.items(), key=lambda x: -x[1]["host_us"])
-    header = f"  {'Op Name':<35} {'Count':>8} {'Host(ms)':>10} {'Device(ms)':>10} {'H/D Ratio':>10}"
+    header = f"  {'Op Name':<35} {'Count':>8} {'Host(ms)':>10} {'Device(ms)':>10} {'H/D Ratio':>10} {'Pure':>5}"
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
     for name, info in op_sorted_host[:top_k]:
         ratio = info["host_us"] / info["device_us"] if info["device_us"] > 0 else float('inf')
         ratio_str = f"{ratio:.1f}x" if ratio < 10000 else "inf"
+        pure_mark = "  ✓" if info["device_us"] == 0 else ""
         lines.append(
             f"  {name:<35} {info['count']:>8} "
             f"{info['host_us']/1000:>10.1f} {info['device_us']/1000:>10.1f} "
-            f"{ratio_str:>10}"
+            f"{ratio_str:>10}{pure_mark}"
         )
     lines.append("")
 
-    # 纯 host op（完全无 device 时间）
+    # 纯 host op 分类：区分真 metadata op 和 dispatch wrapper
     pure_host = [(name, info) for name, info in op_sorted_host
                  if info["device_us"] == 0 and info["host_us"] > 0]
     pure_host_total = sum(info["host_us"] for _, info in pure_host)
     pure_host_pct = pure_host_total / total_host_us * 100 if total_host_us > 0 else 0
 
-    lines.append(f"## 纯 Host Op (未触发 device kernel)")
-    lines.append(f"  纯 host 总耗时: {pure_host_total/1000:.1f} ms ({pure_host_pct:.1f}% 占全部 host 时间)")
-    lines.append(f"  这些是 metadata/framework 操作，不产生任何 device 工作。")
-    lines.append("")
-    header2 = f"  {'Op Name':<35} {'Count':>8} {'Host(ms)':>10}"
-    lines.append(header2)
-    lines.append("  " + "-" * (len(header2) - 2))
-    for name, info in pure_host[:top_k]:
-        lines.append(f"  {name:<35} {info['count']:>8} {info['host_us']/1000:>10.1f}")
+    # 真 metadata op: Device Self = 0 且 Device Total = 0（不触发任何 device 工作）
+    metadata_ops = [(n, i) for n, i in pure_host if i["device_total"] == 0]
+    # Dispatch wrapper: Device Self = 0 但 Device Total > 0（通过子 op 触发 device 工作）
+    wrapper_ops = [(n, i) for n, i in pure_host if i["device_total"] > 0]
+
+    metadata_total = sum(i["host_us"] for _, i in metadata_ops)
+    wrapper_total = sum(i["host_us"] for _, i in wrapper_ops)
+
+    lines.append(f"  纯 Host Op 合计: {pure_host_total/1000:.1f} ms ({pure_host_pct:.1f}% 占全部 host 时间)")
+    if metadata_ops or wrapper_ops:
+        lines.append(f"    Metadata op（无任何 device 工作）: {metadata_total/1000:.1f} ms — 编译可自动消除")
+        lines.append(f"    Dispatch wrapper（自身无 device，子 op 有）: {wrapper_total/1000:.1f} ms — 正常调用层次开销")
     lines.append("")
 
     # --- 按 category 拆解 host 时间 (C1) ---
@@ -166,6 +172,25 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         if dispatch_total > 0:
             lines.append(f"  dispatch 合计:                {dispatch_total/1000:.1f} ms  ({dispatch_total/total_host_us*100:.1f}%)")
         lines.append("")
+
+    # --- Host Total 路径（编译粒度参考）---
+    # Host Total 展示哪些高层 op 包含了最多的子 op 开销——这些是好的编译粒度目标
+    op_with_total = [(name, info) for name, info in op_sorted_host
+                     if info["host_total_us"] > 0 and info["host_total_us"] > info["host_us"] * 1.5]
+    if op_with_total:
+        total_sorted = sorted(op_with_total, key=lambda x: -x[1]["host_total_us"])
+        # 只输出 Self/Total 比例低的（即大量时间在子 op 中的 wrapper）
+        interesting = [(n, i) for n, i in total_sorted
+                       if i["host_us"] / i["host_total_us"] < 0.5 and i["host_total_us"] > total_host_us * 0.05]
+        if interesting:
+            lines.append("## Host-Total 路径（编译粒度参考）")
+            lines.append("  Self/Total 比例低的 op = 开销主要在子 op 中。编译该 op 可一次性消除所有子 op dispatch。")
+            lines.append(f"  {'Op Name':<35} {'Host Total(ms)':>13} {'Host Self(ms)':>12} {'Self%':>6}")
+            lines.append("  " + "-" * 70)
+            for name, info in interesting[:8]:
+                self_pct = info["host_us"] / info["host_total_us"] * 100
+                lines.append(f"  {name:<35} {info['host_total_us']/1000:>13.1f} {info['host_us']/1000:>12.1f} {self_pct:>5.0f}%")
+            lines.append("")
 
     # --- 'other' 类别自动分解 ---
     # 当 other 占比 > 10% 时，列出其中的 Top op，避免 agent 手动从 Top-15 表关联。
@@ -204,7 +229,6 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
 
     # 可疑信号
     lines.append("## 可疑信号")
-    lines.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，根因未定 — 需结合其他 profiling 维度交叉验证")
     suspects_found = False
 
     if pure_host_pct > threshold("operator_details", "pure_host_pct", 50):
@@ -220,18 +244,6 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         for name, info in high_ratio[:5]:
             lines.append(f"    {name}: host={info['host_us']/1000:.1f}ms vs device={info['device_us']/1000:.1f}ms")
         lines.append(f"    用 --filter <op> 查看 Call Stack 源码位置，trace_view 查看 host dispatch 积压")
-        suspects_found = True
-
-    # A5: AI_CPU fallback — AICore 占比低说明 device 时间大量在 AI_CPU 上
-    aicpu_ops = [(name, info) for name, info in op_sorted_host
-                 if info["device_us"] > threshold("operator_details", "aicpu_fallback_min_device_us", 1000) and info["device_aicore"] / info["device_us"] < threshold("operator_details", "aicpu_fallback_aicore_ratio", 0.5)
-                 and info["device_us"] > 0]
-    if aicpu_ops:
-        lines.append(f"  - [DEFINITE] AI_CPU fallback (AICore 占比 <50%):")
-        for name, info in aicpu_ops[:5]:
-            lines.append(f"    {name}: device={info['device_us']/1000:.1f}ms  aicore={info['device_aicore']/1000:.1f}ms "
-                         f"({info['device_aicore']/info['device_us']*100:.0f}% on AICore)")
-        lines.append(f"    - 用 AI Core impl 替换 / 更改 dtype")
         suspects_found = True
 
     if not suspects_found:

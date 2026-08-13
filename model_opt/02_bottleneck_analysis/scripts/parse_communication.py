@@ -167,7 +167,6 @@ def parse(comm_path: Path, matrix_path: Path, top_k: int) -> str:
 
     # --- 5. 可疑信号 ---
     L.append("## 5. 可疑信号")
-    L.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，需结合其他维度交叉验证")
     suspects = False
 
     # Wait ratio 偏高

@@ -91,7 +91,6 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
         lines.append("## Node 级 Launch")
         for t, name, cnt, avg, mx in node["apis"]:
             lines.append(f"  {name}: count={cnt:,}  total={t/1000:.1f}ms  avg={avg:.1f}us")
-        lines.append(f"  (count 应与 trace_view Node@launch 事件一致)")
         lines.append("")
 
     # communication API
@@ -106,6 +105,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
     # 对 acl API 分类以找出主导的 host-API 开销来源
     if acl:
         cat_us = defaultdict(float)
+        tiling_ops = []  # (time, name) for top tiling when other dominates
         for t, name, *_ in acl["apis"]:
             nl = name.lower()
             if any(k in nl for k in ("free", "malloc", "mapphysical", "unmapmem", "alloc", "freephysical")):
@@ -118,16 +118,27 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20) -> str:
                 cat_us["workspace"] += t
             elif nl.endswith("_tiling"):
                 cat_us["tiling"] += t
+                tiling_ops.append((t, name))
             elif "launch" in nl:
                 cat_us["launch"] += t
             else:
                 cat_us["other"] += t
         if cat_us:
+            other_us = cat_us.get("other", 0)
+            other_pct = other_us / total_time * 100 if total_time > 0 else 0
+            # 当 other > 50% 时，category 分布无信息量；改为输出 top API
+            if other_pct > 50:
+                lines.append(f"  other 占比 {other_pct:.0f}%（多为 aclrtStreamGetId 等框架调用），category 分布信息量低。")
+                lines.append(f"  Top 5 ACL API (按耗时):")
+                top_apis = sorted(acl["apis"], key=lambda x: -x[0])[:5]
+                for t, name, cnt, avg, mx in top_apis:
+                    lines.append(f"    {name:<30} total={t/1000:.1f}ms  count={cnt:,}  avg={avg:.1f}us")
+            else:
+                for c, u in sorted(cat_us.items(), key=lambda x: -x[1]):
+                    lines.append(f"  {c:<16} {u/1000:>9.1f} ms ({u/total_time*100 if total_time>0 else 0:>5.1f}%)")
             dom_cat, dom_us = max(cat_us.items(), key=lambda x: x[1])
             dom_pct = dom_us / total_time * 100 if total_time > 0 else 0
-            for c, u in sorted(cat_us.items(), key=lambda x: -x[1]):
-                lines.append(f"  {c:<16} {u/1000:>9.1f} ms ({u/total_time*100 if total_time>0 else 0:>5.1f}%)")
-            if dom_pct > threshold("api_statistic", "dominant_category_pct", 20):
+            if dom_pct > threshold("api_statistic", "dominant_category_pct", 20) and dom_cat != "other":
                 hint = {
                     "memory mgmt": "- Memory mgmt 主导（Free/Malloc/Unmap）。高 churn = 频繁 alloc/free；buffer 复用可减少。operator_memory 可确认重复 alloc。",
                     "stream/device sync": "- Sync 主导（SynchronizeStream/Device）。显式 sync 或 .item() 强制 D-H；避免循环中隐式同步。operator_details 的 sync category 可定位触发源。",

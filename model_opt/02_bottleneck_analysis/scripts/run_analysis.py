@@ -2,12 +2,13 @@
 """Profiling 统一分析入口。
 
 按顺序执行所有 parse 脚本，输出一份完整的分析报告。
-各脚本的原始输出逐字保留，仅按逻辑分组。
+报告开头生成 Executive Summary（瓶颈判定 + 关键数字 + 信号汇总）。
 
 用法:
     python run_analysis.py <L1 profiling 目录> [--l0-dir <L0目录>] [--rank N] [--output 报告路径]
 
 报告结构:
+    Executive Summary（自动生成）
     A. 全局视角 (step_trace, + L0 交叉验证)
     B. 设备侧：算子分布 (op_statistic)
     C. 设备侧：Kernel 级详情 (kernel_details)
@@ -27,7 +28,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from common import find_ascend_profiler_output
+from common import find_ascend_profiler_output, read_csv_all, safe_float
 
 import parse_step_trace
 import parse_op_statistic
@@ -42,6 +43,68 @@ import parse_communication
 
 DIVIDER = "=" * 70
 SUB_DIVIDER = "-" * 70
+
+
+def _extract_step_trace_summary(profiling_dir: str, rank=None):
+    """直接从 CSV 提取 step_trace 关键数字（不依赖文本解析）。"""
+    try:
+        ascend_dir = find_ascend_profiler_output(profiling_dir, rank)
+        csv_path = ascend_dir / "step_trace_time.csv"
+        rows = read_csv_all(csv_path)
+        if not rows:
+            return None
+        step_data = [parse_step_trace._row_totals(r) for r in rows]
+        agg_keys = ["computing", "free", "comm_not_ovl", "total"]
+        tot = {k: sum(s[k] for s in step_data) for k in agg_keys}
+        T = tot["total"]
+        if T <= 0:
+            return None
+        return {
+            "total_ms": T / 1000,
+            "computing_ms": tot["computing"] / 1000,
+            "free_ms": tot["free"] / 1000,
+            "comm_not_ovl_ms": tot["comm_not_ovl"] / 1000,
+            "utilization": tot["computing"] / T * 100,
+            "optimizable": (tot["free"] + tot["comm_not_ovl"]) / T * 100,
+        }
+    except Exception:
+        return None
+
+
+def _build_executive_summary(l1_summary, l0_summary) -> str:
+    """生成数值概览 — 仅包含各节独立做不到的跨脚本信息。"""
+    lines = [SUB_DIVIDER, "--- 数值概览 ---", ""]
+
+    # 时间分解
+    lines.append("## 时间分解")
+    if l0_summary:
+        lines.append(f"  L0 (真实性能): Total {l0_summary['total_ms']:.1f}ms = "
+                     f"Computing {l0_summary['computing_ms']:.1f}ms ({l0_summary['utilization']:.0f}%) + "
+                     f"Free {l0_summary['free_ms']:.1f}ms ({100-l0_summary['utilization']:.0f}%)"
+                     + (f" + Comm {l0_summary['comm_not_ovl_ms']:.1f}ms" if l0_summary['comm_not_ovl_ms'] > 0 else ""))
+    if l1_summary:
+        if l0_summary:
+            delta_pp = l0_summary["utilization"] - l1_summary["utilization"]
+            if delta_pp > 20:
+                lines.append(f"  L1 (含 profiler): Total {l1_summary['total_ms']:.1f}ms — "
+                             f"profiler 伪影严重 (Utilization 差 {delta_pp:.0f}pp)，瓶颈判定以 L0 为准")
+            else:
+                lines.append(f"  L1: Total {l1_summary['total_ms']:.1f}ms, Utilization {l1_summary['utilization']:.1f}% "
+                             f"(与 L0 差 {delta_pp:.0f}pp，profiler 影响可接受)")
+        else:
+            lines.append(f"  L1: Total {l1_summary['total_ms']:.1f}ms = "
+                         f"Computing {l1_summary['computing_ms']:.1f}ms ({l1_summary['utilization']:.0f}%) + "
+                         f"Free {l1_summary['free_ms']:.1f}ms ({100-l1_summary['utilization']:.0f}%)"
+                         + (f" + Comm {l1_summary['comm_not_ovl_ms']:.1f}ms" if l1_summary['comm_not_ovl_ms'] > 0 else ""))
+            lines.append(f"  (无 L0 交叉验证，L1 数字可能含 profiler 伪影)")
+    lines.append("")
+
+    # 信号图例（全局声明一次）
+    lines.append("## 信号标记说明")
+    lines.append("  [DEFINITE] = 可直接行动  |  [SIGNAL] = 异常，需结合其他维度交叉验证")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def run_section(title: str, func, *args, **kwargs) -> str:
@@ -72,6 +135,10 @@ def main():
     l1_dir = args.profiling_dir
     rank = args.rank
 
+    # 提取 step_trace 关键数字（用于 Executive Summary）
+    l1_summary = _extract_step_trace_summary(l1_dir, rank)
+    l0_summary = _extract_step_trace_summary(args.l0_dir, rank) if args.l0_dir else None
+
     sections = []
     sections.append(DIVIDER)
     sections.append("=== Phase 2 Profiling 分析报告 ===")
@@ -84,6 +151,8 @@ def main():
         sections.append(f"Rank: {rank}")
     sections.append("")
 
+    # --- 各节内容生成 ---
+
     # --- A. 全局视角 ---
     section_a = [SUB_DIVIDER, "--- A. 全局视角 ---", ""]
 
@@ -93,10 +162,11 @@ def main():
         section_a.append("")
         section_a.append("[L0] " + parse_step_trace.parse(args.l0_dir, rank).rstrip())
         section_a.append("")
-        section_a.append("⚠ L0/L1 交叉验证：对比上方 L0 和 L1 的 Computing%/Free%/Utilization。")
-        section_a.append("  若 L1 Utilization 显著低于 L0（差 >20pp），L1 的低利用率可能由")
-        section_a.append("  profiler barrier 注入导致。瓶颈类型判定以 L0 为准；L1 的算子级")
-        section_a.append("  数据（op_statistic、kernel_details 等）仍然有效。")
+        # 结构化 L0/L1 交叉验证对比
+        section_a.append("## L0/L1 交叉验证")
+        section_a.append("  对比 L0（无 profiler 开销的真实性能）和 L1（含 profiler barrier 的详细数据）：")
+        section_a.append("  若 L1 Utilization 显著低于 L0（差 >20pp），瓶颈类型判定以 L0 为准；")
+        section_a.append("  L1 的算子级数据（op_statistic、kernel_details 等）仍然有效。")
 
     section_a.append("")
     sections.append("\n".join(section_a))
@@ -161,9 +231,13 @@ def main():
 
     sections.append(DIVIDER)
 
-    report = "\n".join(sections)
+    # 生成数值概览
+    exec_summary = _build_executive_summary(l1_summary, l0_summary)
 
-    # 确定输出路径: 指定了 --output 则用指定路径，否则默认保存到 L1 目录下
+    # 最终报告: 数值概览在报告头之后
+    report = "\n".join(sections[:5]) + "\n" + exec_summary + "\n" + "\n".join(sections[5:])
+
+    # 确定输出路径
     if args.output:
         output_path = Path(args.output)
     else:

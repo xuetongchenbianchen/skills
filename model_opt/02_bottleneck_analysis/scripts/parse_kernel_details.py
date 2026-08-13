@@ -105,6 +105,19 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # 高 wait kernel 及上下文
     all_kernels = []
 
+    # P1: OP State 统计
+    op_state_counts = defaultdict(int)
+
+    # P2: Input Data Types 统计
+    dtype_counts = defaultdict(int)
+
+    # P5: per-op-type 硬件效率聚合
+    op_type_hw = defaultdict(lambda: {"dur_sum": 0.0, "mac_wsum": 0.0, "mte_wsum": 0.0,
+                                       "vec_wsum": 0.0, "scalar_wsum": 0.0, "count": 0})
+
+    # P6: Block Dim + duration 关联（低并行度慢 kernel）
+    low_par_slow = []  # (dur, name, block_dim, shape)
+
     for row in stream_csv(csv_path):
         total_rows += 1
         dur = safe_float(row.get("Duration(us)", 0))
@@ -120,6 +133,19 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
         start_time = safe_float(row.get("Start Time(us)", 0))
         stream_id = row.get("Stream ID", "?").strip()
         input_formats = row.get("Input Formats", "").strip()
+
+        # P1: OP State
+        op_state = row.get("OP State", "").strip()
+        if op_state:
+            op_state_counts[op_state] += 1
+
+        # P2: Input Data Types
+        input_dtypes = row.get("Input Data Types", "").strip()
+        if input_dtypes:
+            for dt in input_dtypes.replace(";", " ").replace('"', '').split():
+                dt = dt.strip()
+                if dt:
+                    dtype_counts[dt] += 1
 
         core_stats[core]["count"] += 1
         core_stats[core]["dur_us"] += dur
@@ -159,10 +185,21 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
                     cube_util_min = cube_util
                 if cube_util < _cube_low:
                     cube_low_util_count += 1
+            # P5: per-op-type 硬件聚合
+            hw = op_type_hw[op_type]
+            hw["dur_sum"] += dur
+            hw["mac_wsum"] += mac_ratio * dur
+            hw["mte_wsum"] += (mte1_ratio + mte2_ratio) * dur
+            hw["scalar_wsum"] += scalar_ratio * dur
+            hw["count"] += 1
             # 可疑：高 duration 但 compute ratio 低
             if dur > _suspect_min_dur and mac_ratio < _suspect_mac:
+                # P3: 记录瓶颈归因（哪个单元最高）
+                bottleneck = "mte" if (mte1_ratio + mte2_ratio) > scalar_ratio else "scalar"
+                if (mte1_ratio + mte2_ratio) < 0.1 and scalar_ratio < 0.1:
+                    bottleneck = "pipeline-bubble"
                 entry = (dur, total_rows, name, core, mac_ratio,
-                         mte1_ratio + mte2_ratio, row.get("Input Shapes", ""), block_dim)
+                         mte1_ratio + mte2_ratio, row.get("Input Shapes", ""), block_dim, bottleneck)
                 if len(suspect_heap) < top_k:
                     heapq.heappush(suspect_heap, entry)
                 elif dur > suspect_heap[0][0]:
@@ -174,6 +211,9 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
                     heapq.heappush(compute_bound_heap, cb_entry)
                 elif dur > compute_bound_heap[0][0]:
                     heapq.heapreplace(compute_bound_heap, cb_entry)
+            # P6: 低并行度 + 高 duration
+            if block_dim > 0 and block_dim <= 8 and dur > 50:
+                low_par_slow.append((dur, name, block_dim, row.get("Input Shapes", "")[:40]))
 
         elif core == "AI_VECTOR_CORE" and dur > 0:
             aiv_kernels += 1
@@ -192,10 +232,20 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
                 aiv_icache_dur_sum += dur
                 if aiv_icache_miss > aiv_icache_max:
                     aiv_icache_max = aiv_icache_miss
+            # P5: per-op-type 硬件聚合
+            hw = op_type_hw[op_type]
+            hw["dur_sum"] += dur
+            hw["vec_wsum"] += vec_ratio * dur
+            hw["mte_wsum"] += (aiv_mte2_ratio + aiv_mte3_ratio) * dur
+            hw["scalar_wsum"] += aiv_scalar_ratio_val * dur
+            hw["count"] += 1
             # 可疑：高 duration 但 vec ratio 低
             if dur > _suspect_min_dur and vec_ratio < _suspect_vec:
+                bottleneck = "mte" if (aiv_mte2_ratio + aiv_mte3_ratio) > aiv_scalar_ratio_val else "scalar"
+                if (aiv_mte2_ratio + aiv_mte3_ratio) < 0.1 and aiv_scalar_ratio_val < 0.1:
+                    bottleneck = "pipeline-bubble"
                 entry = (dur, total_rows, name, core, vec_ratio,
-                         aiv_mte2_ratio + aiv_mte3_ratio, row.get("Input Shapes", ""), block_dim)
+                         aiv_mte2_ratio + aiv_mte3_ratio, row.get("Input Shapes", ""), block_dim, bottleneck)
                 if len(suspect_heap) < top_k:
                     heapq.heappush(suspect_heap, entry)
                 elif dur > suspect_heap[0][0]:
@@ -282,15 +332,8 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     lines.append(f"Kernel 总数: {total_rows:,}  |  Compute: {total_dur_us/1000:.1f}ms  |  Wait: {total_wait_us/1000:.1f}ms")
     lines.append("")
 
-    # --- 1. Accelerator Core 分布 ---
-    lines.append("## 1. Accelerator Core 分布")
-    for core, info in sorted(core_stats.items(), key=lambda x: -x[1]["dur_us"]):
-        pct = info["dur_us"] / total_dur_us * 100 if total_dur_us > 0 else 0
-        lines.append(f"  {core}: {info['count']:,} 个 kernel, {info['dur_us']/1000:.1f}ms ({pct:.1f}%)")
-    lines.append("")
-
-    # --- 2. 硬件单元利用率 ---
-    lines.append("## 2. 硬件单元利用率（duration 加权）")
+    # --- 1. 硬件单元利用率 (Core Type 分布已在 op_statistic 输出，此处不重复) ---
+    lines.append("## 1. 硬件单元利用率（duration 加权）")
     if aic_kernels > 0:
         lines.append(f"  AI_CORE ({aic_kernels} 个 kernel, {aic_dur_sum/1000:.1f}ms):")
         wmac = aic_mac_wsum / aic_dur_sum
@@ -332,8 +375,8 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
         lines.append("  [!] 所有 ratio 均为 0 — 请检查采集时是否使用 aic_metrics=PipeUtilization")
     lines.append("")
 
-    # --- 3. Kernel Duration 分布 ---
-    sec_num = 3
+    # --- 2. Kernel Duration 分布 ---
+    sec_num = 2
     lines.append(f"## {sec_num}. Kernel Duration 分布")
     dur_counted = sum(dur_buckets.values())
     for bucket, count in dur_buckets.items():
@@ -392,22 +435,23 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # --- 7. 可疑信号（诊断）---
     sec_num += 1
     lines.append(f"## {sec_num}. 可疑信号")
-    lines.append("  [DEFINITE]=可直接行动  [SIGNAL]=异常，需结合其他维度交叉验证")
     lines.append("")
 
-    # 7a. 可疑 kernel
+    # 7a. 可疑 kernel — 加瓶颈归因
     suspect_sorted = sorted(suspect_heap, key=lambda x: -x[0])
     if suspect_sorted:
         lines.append("  [SIGNAL] 高 duration、低 compute ratio — 交叉验证: 用 --filter <op> 查看 shape 分布")
-        header = f"  {'Name':<42} {'Core':<5} {'Dur(us)':>8} {'Compute':>8} {'Move':>8} {'BDim':>5} {'Shapes'}"
+        header = f"  {'Name':<42} {'Core':<5} {'Dur(us)':>8} {'Compute':>8} {'Move':>8} {'BDim':>5} {'Bottleneck':<12} {'Shapes'}"
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
-        for dur, _, name, core, compute_ratio, move_ratio, shapes, bdim in suspect_sorted:
-            shapes_clean = shapes.replace("\n", " ").replace(";", "|").replace('"', '')[:30]
+        for entry in suspect_sorted:
+            dur, _, name, core, compute_ratio, move_ratio, shapes, bdim = entry[:8]
+            bottleneck = entry[8] if len(entry) > 8 else "?"
+            shapes_clean = shapes.replace("\n", " ").replace(";", "|").replace('"', '')[:25]
             core_short = "AIC" if "AI_CORE" == core else "AIV"
             lines.append(
                 f"  {name:<42} {core_short:<5} {dur:>8.1f} "
-                f"{compute_ratio:>7.3f} {move_ratio:>7.3f} {bdim:>5} {shapes_clean}")
+                f"{compute_ratio:>7.3f} {move_ratio:>7.3f} {bdim:>5} {bottleneck:<12} {shapes_clean}")
         lines.append("")
 
     # 7a-bis. 真正的 compute-bound kernel（高 duration + 高 compute ratio）
@@ -422,28 +466,45 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
             lines.append(f"  {name:<42} {dur:>8.1f} {mac_ratio:>5.2f} {bdim:>5} {shapes_clean}")
         lines.append("")
 
-    # 7b. 高 wait 上下文
+    # 7b. 高 wait 上下文 — 按模式聚合
     high_wait_indices = [i for i, k in enumerate(all_kernels) if k["wait"] > wait_threshold]
     if high_wait_indices:
         lines.append(f"  [SIGNAL] 高 wait kernel (wait > {wait_threshold:.0f}us) — 在 trace_view 中查找原因")
         lines.append("")
-        top_waits = sorted(high_wait_indices, key=lambda i: -all_kernels[i]["wait"])[:min(top_k, 8)]
-        for rank_idx, idx in enumerate(top_waits, 1):
+        # 按 kernel name 模式聚合
+        from collections import Counter as _Counter
+        wait_patterns = defaultdict(lambda: {"count": 0, "total_wait": 0.0, "max_wait": 0.0, "example_idx": None})
+        for idx in high_wait_indices:
             k = all_kernels[idx]
-            lines.append(f"  [{rank_idx}] #{idx} {k['name']}  wait={format_duration_ms(k['wait'])}  stream={k['stream']}")
-            # 同一 stream 上的时间邻居（非文件顺序）
-            s_order = stream_order.get(k["stream"], [])
-            pos = s_order.index(idx) if idx in s_order else -1
-            context = 2
-            if pos >= 0:
-                lo = max(0, pos - context)
-                hi = min(len(s_order), pos + context + 1)
-                for p in range(lo, hi):
-                    ci = s_order[p]
-                    ck = all_kernels[ci]
-                    marker = " <<<" if ci == idx else ""
-                    lines.append(f"      [{ci}] {ck['type']:<20} dur={ck['dur']:>7.1f}us  wait={ck['wait']:>7.0f}us{marker}")
-            lines.append("")
+            pat = k["name"]
+            wp = wait_patterns[pat]
+            wp["count"] += 1
+            wp["total_wait"] += k["wait"]
+            wp["max_wait"] = max(wp["max_wait"], k["wait"])
+            if wp["example_idx"] is None:
+                wp["example_idx"] = idx
+        pat_sorted = sorted(wait_patterns.items(), key=lambda x: -x[1]["total_wait"])
+        lines.append(f"  按模式聚合 ({len(high_wait_indices)} 个 kernel, {len(wait_patterns)} 种模式):")
+        for pat_name, info in pat_sorted[:8]:
+            lines.append(f"    {pat_name[:50]}  count={info['count']}  avg_wait={info['total_wait']/info['count']/1000:.1f}ms  max={info['max_wait']/1000:.1f}ms")
+        lines.append("")
+        # 展示第一个模式的上下文作为示例
+        first_pat = pat_sorted[0]
+        example_idx = first_pat[1]["example_idx"]
+        k = all_kernels[example_idx]
+        lines.append(f"  示例上下文 ({first_pat[0][:40]}):  stream={k['stream']}")
+        s_order = stream_order.get(k["stream"], [])
+        pos = s_order.index(example_idx) if example_idx in s_order else -1
+        context = 2
+        if pos >= 0:
+            lo = max(0, pos - context)
+            hi = min(len(s_order), pos + context + 1)
+            for p in range(lo, hi):
+                ci = s_order[p]
+                ck = all_kernels[ci]
+                marker = " <<<" if ci == example_idx else ""
+                lines.append(f"      [{ci}] {ck['type']:<20} dur={ck['dur']:>7.1f}us  wait={ck['wait']:>7.0f}us{marker}")
+        lines.append("")
 
     # 7c. Fusible 算子序列
     if fusible_sequences:
@@ -462,6 +523,58 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     if not suspect_sorted and not cb_sorted and not high_wait_indices and not fusible_sequences:
         lines.append("  无")
         lines.append("")
+
+    # --- 新增：per-op-type 硬件效率聚合 ---
+    if op_type_hw:
+        lines.append("## Per-Op-Type 硬件效率（duration 加权）")
+        hw_sorted = sorted(op_type_hw.items(), key=lambda x: -x[1]["dur_sum"])
+        lines.append(f"  {'Op Type':<28} {'Kernels':>7} {'Time(ms)':>8} {'Compute':>8} {'Memory':>8} {'Scalar':>8} {'Bound'}")
+        lines.append("  " + "-" * 85)
+        for op_t, hw in hw_sorted[:12]:
+            if hw["dur_sum"] <= 0:
+                continue
+            compute = (hw["mac_wsum"] + hw["vec_wsum"]) / hw["dur_sum"]
+            memory = hw["mte_wsum"] / hw["dur_sum"]
+            scalar = hw["scalar_wsum"] / hw["dur_sum"]
+            # 判定主导瓶颈
+            if compute > memory and compute > scalar:
+                bound = "compute"
+            elif memory > compute and memory > scalar:
+                bound = "memory"
+            elif scalar > compute and scalar > memory:
+                bound = "scalar"
+            else:
+                bound = "-"
+            lines.append(f"  {op_t:<28} {hw['count']:>7} {hw['dur_sum']/1000:>8.2f} "
+                         f"{compute:>8.3f} {memory:>8.3f} {scalar:>8.3f} {bound}")
+        lines.append("")
+
+    # --- OP State: 仅作为事实记录在头部，不单独出信号 ---
+    # （dynamic 标签本身不代表问题；实际 tiling 开销由 api_statistic G 节检测）
+
+    # --- 新增信号：Input Data Types 分布 ---
+    if dtype_counts:
+        total_dtypes = sum(dtype_counts.values())
+        fp32_count = sum(c for dt, c in dtype_counts.items() if "FLOAT" == dt.upper() or "FP32" in dt.upper() or "FLOAT32" in dt.upper())
+        fp32_ratio = fp32_count / total_dtypes if total_dtypes > 0 else 0
+        if fp32_ratio > threshold("kernel_details", "fp32_ratio_signal", 0.5):
+            lines.append(f"## Data Types")
+            dtype_str = ", ".join(f"{dt}:{c}" for dt, c in sorted(dtype_counts.items(), key=lambda x: -x[1])[:5])
+            lines.append(f"  分布: {dtype_str}")
+            lines.append(f"  [SIGNAL] FP32 占比 {fp32_ratio*100:.0f}% — 若模型支持混合精度，fp16/bf16 可减少内存带宽和计算量")
+            lines.append("")
+
+    # --- 新增信号：低并行度慢 kernel ---
+    if low_par_slow:
+        low_par_slow.sort(key=lambda x: -x[0])
+        total_low_par_dur = sum(d for d, *_ in low_par_slow)
+        if total_low_par_dur / total_dur_us > 0.05:  # 仅当贡献 > 5% 时报告
+            lines.append(f"## 低并行度慢 Kernel")
+            lines.append(f"  [SIGNAL] Block Dim ≤ 8 且 duration > 50us 的 kernel: {len(low_par_slow)} 个, 累计 {total_low_par_dur/1000:.2f}ms")
+            for dur, name, bdim, shape in low_par_slow[:8]:
+                lines.append(f"    {name[:45]}  dur={dur:.1f}us  block_dim={bdim}  shape={shape}")
+            lines.append(f"  - Shape 可能太小无法并行。考虑 batching/padding 或确认是否有更高并行度的算子实现")
+            lines.append("")
 
     return "\n".join(lines)
 
