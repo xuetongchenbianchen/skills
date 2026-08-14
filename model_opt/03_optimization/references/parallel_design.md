@@ -10,7 +10,7 @@
 2. **计算到顶仍不够快**: `parse_kernel_details` 显示 compute-bound(mac_ratio 高 + cube_util 高 + Block Dim 满),单卡已优化到硬件上限但性能仍不满足
 3. **已多卡但效率低**: `parse_step_trace` 显示已有多卡通信(comm 列有值)但 device 利用率 < 50% → 当前并行策略需改进
 
-WARNING **本文档的切分方案需要源码分析,profiling 只提供 trigger。** 进入后:
+⚠ **本文档的切分方案需要源码分析,profiling 只提供 trigger。** 进入后:
 1. 用 operator_details 的 Call Stack 定位大 tensor 的源码位置
 2. 阅读该处的计算结构,找出可切分的大维度
 3. 按下方"切分维度选择"原则评估
@@ -25,7 +25,7 @@ WARNING **本文档的切分方案需要源码分析,profiling 只提供 trigger
 
 ### 分析步骤
 
-1. 定位峰值瞬间所有存活张量的 shape（用 `parse_operator_memory.py` 的 Peak Attribution 节）
+1. 定位峰值瞬间所有存活张量的 shape（见 [memory_profiling.md](../../02_bottleneck_analysis/references/memory_profiling.md)）
 2. 找到这些张量**共享的大维度**
 3. 对候选维度逐一评估：切分后哪些操作仍可本地完成，哪些需要通信
 
