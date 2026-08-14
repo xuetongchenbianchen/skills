@@ -1,43 +1,69 @@
 ---
-name: npu-adaptation-preparation
-description: NPU 适配前期准备：代码理解、CANN 环境搭建、测试数据、profiling 采集与精度验证脚本构建。当用户需要把模型在 NPU 上跑通、搭建/诊断 CANN 环境、采集基线 profiling、或构建精度对比脚本时触发。
+name: NPU 适配前期准备
+description: Phase 1 前期准备。模型 NPU 适配的前期准备工作，包括模型代码理解、CANN 环境搭建、测试数据准备、Profiling 脚本和精度验证脚本的构建。当用户需要从零开始在 NPU 上跑通模型推理时触发。执行前参见根 SKILL.md 全流程。
 ---
 
 # NPU 适配前期准备
+
+详见 [environment_reference.md](references/environment_reference.md) 获取详细的 CANN 环境配置参考。
 
 ---
 
 ## 一、模型代码理解
 
-**目标**：摸清推理路径，避免在错误位置改代码。
+**目标**：在动手适配前，摸清推理路径，避免在错误位置改代码。
 
 ### 系统性探索顺序
-从全局到局部：包入口（`__init__.py`）→ 模型类定义（含 forward）→ 推理入口（main/CLI/pipeline）。关注 config.json 中的架构参数（hidden_size, num_layers, num_heads 等）。
+```bash
+# 1. 看全局结构
+find . -name "*.py" | head -60
 
-### 已有文档阅读
-- 阅读项目 README、设计文档
-- 若有已有适配文档（如其他版本、同系列模型），列出差异点：**可复用 vs 需纠偏**
+# 2. 看包入口，确认对外暴露了什么
+cat src/<package>/__init__.py
+
+# 3. 定位模型类定义（通常含 forward / __call__）
+grep -rn "class.*Model\|class.*Encoder\|class.*Decoder" src/ --include="*.py"
+
+# 4. 定位推理入口（脚本 / CLI / pipeline）
+grep -rn "def main\|if __name__" *.py scripts/*.py
+```
+
+### 从 config.json 快速确认架构
+```python
+import json
+cfg = json.load(open("config.json"))
+# 关注：d_model / hidden_size, num_layers, num_heads, vocab_size, model_type
+```
+
+### 参考文档对比
+- 若有已有适配文档（如其他版本、同系列模型），先列出差异点：**可复用 vs 需纠偏**。
+- 重点关注：自定义算子、特殊注意力变体、非标准位置编码。
 
 ### 特殊输入识别
-- 非文本输入（图像、蛋白质序列、音频等）需确认预处理路径和 tokenizer/encoder 是否独立
-- 检查 `collate_fn` / `DataCollator` 是否有设备绑定逻辑
+- 非文本输入（图像、蛋白质序列、音频等）需确认预处理路径和 tokenizer/encoder 是否独立。
+- 检查 `collate_fn` / `DataCollator` 是否有设备绑定逻辑。
+
+### 确认评测数据集
+- 从 model card / 论文 / README 中确认模型的标准评测数据集（如 ImageNet-val、LibriSpeech test-clean、bridge_orig 等）。
+- 记录数据集名称、split、获取方式，供 §三 数据准备使用。
+- 信息源优先级：HuggingFace Model Card → 原论文 Main Results → GitHub README → 官方 eval 脚本。
 
 ---
 
 ## 二、环境准备
 
-完整环境变量清单见 [environment_reference.md](references/environment_reference.md)。
-
 ### CANN 环境诊断
 ```bash
-npu-smi info                          # 芯片型号、驱动版本、卡数、空闲卡
-ls $ASCEND_HOME_PATH/opp/             # OPP 算子包
+npu-smi info                          # 确认芯片型号、驱动版本、卡数
+ls $ASCEND_HOME_PATH/opp/             # 检查 OPP 算子包
+ls ~/Ascend/ascend-toolkit/           # 用户目录（优先级高于系统目录）
 source ~/Ascend/ascend-toolkit/latest/set_env.sh  # 激活工具链
 ```
 
 ### 多卡管理
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3   # 逻辑编号从 0 开始，可能与物理编号不一致
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3   # 控制可见卡（对应 npu:0,1,2,3）
+# 注意：逻辑编号从 0 开始，与 npu-smi 的物理编号可能不一致
 ```
 
 ### 版本配套确认
@@ -48,157 +74,205 @@ print(torch.__version__, torch_npu.__version__, torchair.__version__)
 ```
 > 版本不配套是最常见的环境问题，优先确认 torch_npu 与 CANN 版本对应表。
 
-### 设备兼容层（init_device 模板）
+### 设备兼容层设计（init_device 模板）
+在任何推理脚本中统一用一个 `init_device` 函数屏蔽平台差异：
 
 ```python
 def init_device(device_str: str):
     if device_str.startswith("npu"):
         import torch_npu
+        # NPU 适配三件套：关闭 JIT 编译 + 关闭内部格式（保证确定性和兼容性）
         torch.npu.set_compile_mode(jit_compile=False)
         torch_npu.npu.config.allow_internal_format = False
     return torch.device(device_str)
 ```
 
-> 默认关闭 jit_compile 和 allow_internal_format 确保确定性。若 profiling 显示相关瓶颈，可逐个开启并验证精度无退化。
-
 ---
 
-## 三、项目 Git 初始化
+## 三、测试数据准备
 
-```bash
-cd /path/to/project
-git init
-git checkout -b optimize/main
+**前置条件**：§一 已完成模型理解，已从 model card / 论文 / README 确认模型的标准评测数据集。
+
+本节从该数据集中准备三份数据，分别服务于后续不同 Phase：
+
+| 数据集 | 数量 | 用途 | 使用时机 |
+|--------|------|------|----------|
+| Profiling 专用数据 | 5-10 条 | 性能 分析（算子耗时、调度开销）| Phase 2 瓶颈分析 |
+| Level 1 验证集 | 32-100 条 | 精度快速验证（优化前后输出比对） | Phase 3 每次优化后 |
+| Level 2 评测集 | 全量 | 任务级精度门禁 | Phase 4 提交前 |
+
+### Profiling 专用数据（5-10 条）
+
+- **用途**：Phase 2 profiling 采集，测量算子耗时和调度开销
+- **来源**：允许使用合成/模拟数据（如 `torch.randn` 构造符合模型输入 shape 的 tensor）。Profiling 只关心计算图的执行时间，不依赖输入内容的语义
+- **要求**：覆盖不同规模档位（如最短、中位、最长各一条），确保 shape/length 与生产环境一致
+- **保存**：`<workspace>/data/profiling_subset.json`（或 `.pkl`）
+
+### Level 1 验证集（32-100 条）
+
+- **用途**：Phase 3 每次优化改动后的精度快速验证——比对 baseline 和 optimized 的输出是否一致
+- **来源**：**必须从真实数据集中抽取**，禁止使用合成/随机数据。原因：浮点精度问题是 value-dependent 的，随机噪声的激活分布与真实数据不同，无法暴露实际部署中可能出现的精度退化
+- **要求**：
+  - 按长度/关键特征分桶（短/中/长），每桶抽若干条
+  - 必须包含 hard cases（决策边界附近的困难样本）
+  - 总量控制在可在 1-2 分钟内完成推理的规模
+- **保存**：`<workspace>/data/level1_samples/`
+
+### Level 2 评测集（全量）
+
+- **用途**：Phase 4 提交前的任务级精度门禁——在完整测试集上跑标准评测，确认任务指标无退化
+- **来源**：**必须是模型发布时使用的标准评测数据集**（如 ImageNet-val、LibriSpeech test-clean），不可用子集或自制数据替代
+- **要求**：Phase 1 阶段确认数据集可获取（本地已有 / 可下载），实际下载可延迟到 Phase 4 执行时
+- **保存**：`<workspace>/data/` 或软链接到共享数据目录
+
+### 代表性数据选取（Level 1 抽样参考）
+```python
+import numpy as np
+lengths = [len(s) for s in dataset]
+# 按长度分桶：短(P10) / 中(P50) / 长(P90)
+indices = np.argsort(lengths)
+short_idx = indices[int(len(indices) * 0.1)]
+median_idx = indices[int(len(indices) * 0.5)]
+long_idx = indices[int(len(indices) * 0.9)]
 ```
 
-### .gitignore 必须覆盖的大文件
-
-```gitignore
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.ckpt
-*.h5
-profiling/
-*.prof
-*.trace.json
-ASCEND_PROFILER_OUTPUT/
-__pycache__/
-*.pyc
-kernel_meta/
-.venv/
-```
-
 ---
 
-## 四、测试数据准备
+## 四、Profiling 采集体系构建
 
-**原则**：小而代表性，显式覆盖多个维度，不能只按长度分桶。
+**目标**：构建标准化的性能数据采集流程，为后续瓶颈分析提供可靠数据。
 
-### 覆盖性检查清单
+详见 [profiling_collection.md](references/profiling_collection.md) 获取完整代码模板和框架适配方案。
 
-构造或抽样时逐项确认，每个维度至少 1-2 条代表：
+### Profiling 输出路径规范
 
-| 维度 | 说明 | 示例 |
-|------|------|------|
-| **输入规模** | 最短、中位、最长 | 1 token / 512 / 2048 |
-| **Batch 形态** | batch=1 和 batch>1；不同 padding 比例 | 全填充 / 混合长度 |
-| **边界条件** | padding 边界、mask 形状、空/极短输入 | 全 pad、仅 1 有效 token |
-| **数值范围** | 正常 + 极值（接近 dtype 上溢/下溢） | fp16 max 附近值 |
-| **语义多样性** | 不同任务域/场景/输入类型 | LLM：代码/数学/对话/长上下文 |
-| **推理路径** | 触发不同代码分支 | prefill vs decode；有/无目标 |
-
-### 性能测试集
-
-统计稳定的端到端时间测量。选取标准：
-- 代表真实分布（有生产日志则按真实分布抽样）
-- 50–200 条，含 warmup（前 N 条不计入统计）
-- 用于优化前后对比 wall-clock 均值和 P95
-
-### Profiling 采集集
-
-激活不同计算模式，为瓶颈分析提供代表性轨迹。选取标准：
-- 5–10 条，覆盖最短/中位/最长各一条
-- 多推理路径时每个路径至少一条
-- 保存为 `profiling_subset.json`，与性能测试集分开
-
-**两者不可混用**：性能测试集追求统计稳定性；Profiling 集追求路径覆盖性。
-
----
-
-## 五、Profiling 采集体系构建
-
-完整代码模板和框架适配方案见 [profiling_collection.md](references/profiling_collection.md)。
-
-### 输出路径规范
+所有 profiling 输出**必须**保存在用户工作目录下，禁止使用 `/tmp` 或其他临时目录：
 
 ```
 <workspace>/profiling/
-├── YYYYMMDD_HHMMSS/
+├── YYYYMMDD_HHMMSS/          # 每次采集带时间戳
 │   ├── *.csv
-│   └── trace_view.json
-└── latest -> YYYYMMDD_HHMMSS
+│   ├── trace_view.json
+│   └── ...
+├── YYYYMMDD_HHMMSS/
+└── latest -> YYYYMMDD_HHMMSS  # 软链接指向最新一次
 ```
 
-强制规则：必须用 `tensorboard_trace_handler` + 时间戳路径；禁止 `/tmp`；禁止 `export_chrome_trace`（不产出 `step_trace_time.csv`）。
+**路径构造模板**：
+```python
+import os, datetime
 
-### 采集级别
+PROFILING_BASE = os.path.join(os.getcwd(), "profiling")
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+profiling_dir = os.path.join(PROFILING_BASE, timestamp)
+os.makedirs(profiling_dir, exist_ok=True)
 
-| 级别 | 内容 | 数据量 |
-|------|------|--------|
-| **L0** | 仅 NPU 活动 | 小 |
-| **L1** | CPU + NPU + 算子详情 + 调用栈 + 内存 + AI Core 指标 | 大 |
+# 更新 latest 软链接
+latest_link = os.path.join(PROFILING_BASE, "latest")
+if os.path.islink(latest_link):
+    os.remove(latest_link)
+os.symlink(timestamp, latest_link)
+```
 
-### 三种性能测量
+**强制规则**：
+- `tensorboard_trace_handler` 的路径参数必须指向 `<workspace>/profiling/<timestamp>/`
+- 禁止使用 `/tmp`、系统临时目录或无时间戳的固定路径
+- 每次采集后更新 `latest` 软链接，方便用户直接查看最新结果
+- `profiling/` 目录已在 `.gitignore` 中排除（详见 05_engineering）
 
-wall-clock（无 profiler 真实时间）、L0（设备执行时间）、L1（瓶颈分析数据）。三者**必须覆盖完全相同的代码范围**。
+### 采集级别选择
 
-### 采集前必设
+三个采集级别对应全流程中不同的用途，按迭代节奏区分：
+
+| 级别 | 内容 | 数据量 | 使用时机 |
+|------|------|--------|----------|
+| **L0** | 仅采集 NPU 活动，最小膨胀 | 小 | **性能判定基线**：项目最开始采集一次作为 baseline；每个优化阶段（profiling 分析 + 优化 + 精度确认的完整流程）结束后再采集一次，与 baseline/上一轮快速比对，判定本轮收益 |
+| **L1** | CPU + NPU + 算子详情 + 调用栈 + 内存 + AI Core 指标（覆盖全部 7 个解析脚本） | 大 | **优化分析主力**：每个优化阶段开始前采集一次，交给 Phase 2 瓶颈分析模块处理，定位优化点 |
+| **L2** | L1 基础上增加 CANN Runtime/GE 数据 + AI CPU 数据（`data_preprocess.csv`） | 更大 | **深度下探**：与 L1 用在同一阶段（阶段开始前），仅当 L1 信息不足以定位优化点时才启用，用于排查 Runtime 底层调度开销或算子 fallback 到 AI CPU |
+
+> **快速比对用 L0，优化分析用 L1，L1 不够再上 L2。** L0 因不注入 CPU 侧 barrier，Host/Device 比例更接近真实，适合作稳定的收益判定基线；L1/L2 数据量大、含 profiler 注入开销，仅在需要定位优化点时采集。
+
+### 采集流程
+
+```
+0. 环境校验（运行本 skill 的 scripts/validate_profiling_env.py）
+→ 1. 确定采集场景（训练 / 推理）
+→ 2. 选择采集级别（基线判定 L0 / 优化分析 L1 / 深度下探 L2）
+→ 3. 植入 Profiling 代码（按框架选择模板）
+→ 4. 设置环境变量（TASK_QUEUE_ENABLE, CPU_AFFINITY_CONF）
+→ 5. 执行采集，产出 trace 文件
+→ 6. 进入 Phase 2 分析
+```
+
+### 采集前必设环境变量
 
 ```bash
-export TASK_QUEUE_ENABLE=2    # Host-Device 异步流水，接近生产环境真实性能
-export CPU_AFFINITY_CONF=1    # CPU 绑核，减少调度抖动
+# 必须在启动脚本前设置
+export TASK_QUEUE_ENABLE=2    # Host-Device 异步流水，获得接近生产环境的真实性能
+export CPU_AFFINITY_CONF=1    # CPU 绑核，减少调度抖动，使采集数据稳定可复现
 ```
 
-### 关键规则
+> 完整的环境变量清单（含性能优化变量和 Python 级设置）见 [environment_reference.md](references/environment_reference.md)「环境变量配置清单」。
 
-- **不改业务代码的 CUDA 写法**：`import torch_npu` + `transfer_to_npu` 自动转换
-- **多推理路径分离采集**：prefill/decode 等分别建立独立 profiling 段
-- **GPU/NPU 对称采集**：跨平台对比时 GPU 用相同 schedule + `CUDA` activity
+### 重要默认行为
+
+1. **不要修改业务代码中的 CUDA 写法**：通过 `import torch_npu` + `transfer_to_npu`，业务代码中的 `.cuda()` 会自动转为 NPU 调用。Profiling 代码使用 `torch_npu.profiler` 是必要的，但业务脚本保持原样。
+2. **多推理路径分离采集**：不同推理模式（encoder-only / generate / scoring）应分别建立独立 profiling 段，不混合采集。
+3. **GPU/NPU 对称采集**：当需要跨平台对比时，在 GPU 上使用相同 schedule 配置 + `torch.profiler.ProfilerActivity.CUDA`。
+
+### 框架适配指引
+
+| 训练框架 | 接入方式 | 模板位置 |
+|---------|---------|----------|
+| 原生 PyTorch 循环 | `with torch_npu.profiler.profile(...) as prof` | profiling_collection.md §1 |
+| PyTorch Lightning | 自定义 Callback | profiling_collection.md §2.1 |
+| HuggingFace Trainer | 自定义 TrainerCallback | profiling_collection.md §2.2 |
+| DeepSpeed | 全卡采集，按 rank 分目录 | profiling_collection.md §2.3 |
 
 ### 环境预检
 
-采集前运行：
+采集前运行本 skill 提供的环境校验脚本（位于本 skill 的 `scripts/validate_profiling_env.py`）：
 ```bash
-python <skill_path>/01_preparation/scripts/validate_profiling_env.py --device npu:x --output-dir ./profiling
+python <skill_path>/01_preparation/scripts/validate_profiling_env.py --device npu:0 --output-dir ./profiling
 ```
+> 注意：`<skill_path>` 是本 skill 所在目录的实际路径，agent 执行时需替换为真实路径。
 
 ---
 
-## 六、精度验证脚本构建
+## 五、精度验证脚本构建
 
-**目标**：保存可信 baseline 输出，构建可一键运行的对比脚本。
+**目标**：GPU 和 NPU 分别离线保存结果，事后纯 numpy 对比，不依赖双卡同时在线。
 
-### Baseline 来源与对比策略
-
-遵循 [04_accuracy_assurance/SKILL.md](../04_accuracy_assurance/SKILL.md)：按优先级确认基线来源，按输出类型选择距离函数，阈值在比较前声明。本阶段只构建脚本框架，不定义具体方法论。
-
-### 输出保存
-
-原则：离线可加载、不依赖设备、可复现。
-
+### 输出保存约定
 ```python
 import numpy as np, json
-np.save(f"baseline/{sample_id}_output.npy", output.cpu().float().numpy())
-with open(f"baseline/{sample_id}_tokens.json", "w") as f:
+
+# 连续输出（logits、embedding）-> npy
+np.save(f"outputs/{sample_id}_logits.npy", logits.cpu().float().numpy())
+
+# 离散输出（token ids、标签）-> json
+with open(f"outputs/{sample_id}_tokens.json", "w") as f:
     json.dump({"tokens": token_ids}, f)
 ```
 
-### 对比脚本要求
+### 离线对比脚本
+```python
+# compare_outputs.py -- 不依赖任何设备，纯 numpy
+gpu_logits = np.load("gpu_outputs/logits.npy")
+npu_logits = np.load("npu_outputs/logits.npy")
 
-自包含（给定 baseline 目录和当前输出目录即可独立运行），指标和阈值显式声明，运行后输出判定结论。
+cos_sim = np.dot(gpu_logits.flatten(), npu_logits.flatten()) / (
+    np.linalg.norm(gpu_logits) * np.linalg.norm(npu_logits)
+)
+abs_diff = np.abs(gpu_logits - npu_logits).mean()
+print(f"cosine={cos_sim:.6f}  mean_abs_diff={abs_diff:.6f}")
+```
 
-### 确定性条件
-
-推理：`model.eval()` + `torch.no_grad()` + 固定输入 + 关闭随机性。详见 04_accuracy_assurance「一、前提条件」。
+### NPU 确定性验证条件
+```python
+model.eval()
+with torch.no_grad():
+    # 确保 jit_compile=False + allow_internal_format=False 已在 init_device 中设置
+    outputs = model(inputs)
+```
+> 同一输入的 NPU 结果应完全可复现 (bit-exact)。若不可复现，排查：dropout 未关闭、随机算子、或 `allow_internal_format` 未禁用。
