@@ -1,27 +1,28 @@
 ---
-name: npu-model-optimization
-description: 模型性能优化全流程（profiling 驱动的瓶颈分析 → 四维度优化 → 精度验证 → 工程化提交）。当用户想优化模型性能、推理/训练速度、分析 profiling 数据、定位性能瓶颈、或在昇腾 NPU 上做模型适配与调优时触发。
+name: NPU 模型适配优化
+description: 指导将深度学习模型适配到昇腾 NPU 并进行性能优化的全流程技能。当用户提到模型适配、NPU 优化、profiling 分析等任务时触发。
 ---
 
 # NPU 模型适配优化
 
-## 启动协议
+## ⚠ 启动协议
 
 无论从哪个子技能进入，执行前必须：
 1. 确认当前在哪个 Phase（参见下方「全流程」）
 2. 确认上一个 Phase 的产出已完成
 3. 按全流程顺序执行，不跳步
-4. 进入每个phase后，所有reference文件需要按需加载，确认已读/跳过状态，并在 evidence_db 中记录
+4. 进入每个 Phase 前，必须加载并通读对应的子技能文件（子技能索引表中的 SKILL.md）
 
 ## 核心原则
 
 - **Profiling 驱动**：所有优化决策必须有 profiling 数据支撑
 - **源码定位根因**：Profiling 只给出"哪里慢"，必须深入功能性源码的具体实现来定位"为什么慢"
-- **精度优先**：每次改动后必须跑精度验证，未得到用户允许前，禁止对模型做量化操作
+- **微基准先行**：大改动前先写独立 benchmark 验证方向
+- **精度优先**：每次改动后必须跑精度验证
+- **NPU ≠ GPU**：GPU 经验不能直接迁移，必须实测
 - **记录一切**：成功和失败方案都要记录
-- **checkpoint 兼容**：旧 checkpoint 必须仍可加载且数值等价。默认保持 state_dict key/结构不变；当优化涉及结构性融合必须改变结构时，须提供与模型同处的确定性重映射函数，并通过等价性验证（remap 加载后输出与未优化模型对齐）
-- **禁止未仔细分析就动手**：禁止直接用"量化/图编译"来解决性能问题。要先分析瓶颈、定位根因、再定制优化方案。量化/图编译是直觉上的"万能钥匙"，但并不一定能解决问题
-- **不要放弃**：无论是分析定位，还是优化实施，不要只想着简单尝试就结束，而是要穷尽探索（多种实现、完整验证）
+- **checkpoint 兼容**：旧 checkpoint 必须仍可加载且数值等价。默认保持 state_dict key/结构不变；当优化涉及结构性融合（如 QKV 合并、layout 重排）必须改变结构时，须提供与模型同处的确定性重映射函数，并通过等价性验证（remap 加载后输出与未优化模型对齐）
+- **峰值决定 OOM**：显存优化关注同时存活张量的总量，而非累计分配量
 
 ## 标准化操作规范
 
@@ -37,8 +38,7 @@ Profiling 采集、精度对比等操作必须遵循统一规范，确保一致�
 
 ```
 Phase 1  前期准备
-         ├─ 项目 git 初始化 + .gitignore（权重/profiling 等大文件）
-         └─ 采集 L0 基线 + wall-clock benchmark（全程仅一次，作为收益判定基准）
+         └─ 采集 L0 基线（全程仅一次，作为最终收益判定基准）
    ↓
 ┌─────────────────── 一个「优化阶段」（可迭代多轮）───────────────────┐
 │ Phase 2  瓶颈分析                                                  │
@@ -56,27 +56,95 @@ Phase 1  前期准备
    ↓
  ★ B  用户确认提交（展示本批总结 + evidence_db 已记录 → 确认/回退）
    ↓
-Phase 5  工程化提交（git commit + evidence_db 记录）
+Phase 5  工程化提交（git commit + 更新优化日志）
    ↓
  ★ C  用户确认是否继续（展示本轮总结 + 剩余瓶颈 → 继续/停止）
    ↓
- ├─ 继续 → 回到 Phase 2（必须：重新采集 L1 → 重新分析 → 重新估算优化空间，禁止沿用上轮结论）
+ ├─ 继续 → 回到 Phase 2 开启下一轮（重新采集 L1 分析新瓶颈）
  └─ 停止 → 结束
 ```
 
-> **三种性能测量在流程中的落点**：
-> - **wall-clock**：Phase 1 采一次作基线；每个优化阶段 Phase 4 再采一次做收益确认（无 profiler 开销，是收益判定的可靠依据）。
-> - **L0**：Phase 1 采一次作基线；每个优化阶段 Phase 4 采一次做收益比对和下一轮 Phase 2 的 L0/L1 交叉验证。
+> **三个采集级别在流程中的落点**（L0/L1/L2 为 profiling 采集级别，与上文精度验证的 Level 1/Level 2 是不同概念）：
+> - **L0**：Phase 1 采一次作基线；每个优化阶段的 Phase 4 采一次做收益快速比对。
 > - **L1**：每个优化阶段的 Phase 2 开始前采集，交分析模块定位优化点（迭代回环时每轮都重新采）。
-> 三者必须覆盖相同代码范围。定义与模板见 [profiling_collection.md](01_preparation/references/profiling_collection.md)。
+> - **L2**：仅当某轮 L1 信息不足以定位优化点时，在同一 Phase 2 改采。
+> 级别定义与代码模板见 [01_preparation/SKILL.md](01_preparation/SKILL.md)「采集级别选择」及 [profiling_collection.md](01_preparation/references/profiling_collection.md) §1。
 
-## 执行协议（agent 程序约束）
+## 用户确认节点
 
-三个用户确认节点控制迭代流程，详细门禁（优先级覆盖表、Line A 完整性门禁、提交/继续审核）详见 [execution_protocol.md](references/execution_protocol.md)：
+### 确认节点 A：优化方案审核（Phase 2 → Phase 3 之间）
 
-- **★A 方案审核**（Phase 2→3）：展示候选清单（按反事实收益上限降序），须完成优先级覆盖门禁 + Line A 完整性门禁。仅实施用户确认的条目。
-- **★B 提交审核**（Phase 4→5）：展示本批总结（性能+精度），evidence_db 已记录才允许 git commit。
-- **★C 继续确认**（Phase 5 后）：展示本轮总结 + 剩余瓶颈，询问是否开启下一轮。
+Phase 2 分析完成后、进入实施前，**必须**向用户展示优化方案并等待确认：
+
+1. 列出所有建议的优化点，每条包含：优化内容、预期收益、风险等级
+2. 每条方案必须标注"消除的开销类别"和"理论收益上限"（该类别占总时间的比例，引用 parse 脚本输出）
+3. 方案按"理论收益上限"降序排列，而非实现难度
+4. 使用 `ask_user_question` 询问用户：
+   - 方案整体是否合适
+   - 是否有需要跳过/不实施的优化点
+   - 是否有额外想尝试的方向
+5. 根据用户反馈调整优化清单，仅实施用户确认的条目
+6. 每条优化方案必须声明其**预期验证路径**（"数值等价" 或 "近似算法"）：
+   - 数值等价：预期 Level 1 Step 1（原始输出比较）通过
+   - 近似算法：预期 Step 1 不通过，需要 Step 2（任务代理量比较，由 `validation_plan.yaml` 定义）兜底
+   - 判定依据：该优化是否改变了数学语义。FP16/INT8/fast-math 即使只改精度也算"近似算法"
+   - 未声明路径的优化条目 → 不可进入 Phase 3 实施
+
+#### 优先级覆盖门禁（展示候选前必须完成）
+
+[profiling_to_action.md](02_bottleneck_analysis/references/profiling_to_action.md) 的优先级列表定义了优化方向的理论收益排序。向用户展示候选前，必须为**每个优先级**填写下表。
+
+瓶颈类型由 `parse_step_trace.py` 的输出判定（Host-Bound / Compute-Bound / Memory-Bound / Allocator-Bound）。[profiling_to_action.md](02_bottleneck_analysis/references/profiling_to_action.md) 定义了每种瓶颈类型最相关的优先级。
+
+| 优先级 | 类型 | 状态 | 备注 |
+|-------|------|------|------|
+| 1 | 显式同步 | □有候选 / □已排除(附依据) / □不适用 | |
+| 2 | 在线编译 | □有候选 / □已排除(附依据) / □不适用 | |
+| 3 | 图编译 | □有候选 / □已排除(附依据) / □不适用 | |
+| 4 | allocator 同步 | □有候选 / □已排除(附依据) / □不适用 | |
+| 5 | 框架 dispatch | □有候选 / □已排除(附依据) / □不适用 | |
+| 6 | 碎片算子融合 | □有候选 / □已排除(附依据) / □不适用 | |
+| 7 | 数据布局 | □有候选 / □已排除(附依据) / □不适用 | |
+| 8 | kernel 本身慢 | □有候选 / □已排除(附依据) / □不适用 | |
+
+**门禁规则**：
+- 对于 `parse_step_trace.py` 判定的瓶颈类型，`profiling_to_action.md` 映射到该类型的优先级**不可**标记"不适用"——必须有候选或附 profiling 数据依据的"已排除"
+- "已排除"必须引用具体脚本输出作为依据（如"`parse_operator_memory.py` 显示无高频分配"），不可凭空判断
+
+#### Line A 产出完整性门禁
+
+Line A（源码分析）的产出必须包含以下两项分析结果，且其中的发现必须对应候选：
+
+1. **穿透层级量化**（见 [proactive_source_analysis.md](02_bottleneck_analysis/references/proactive_source_analysis.md)「穿透层级量化」）：
+   - 调用链中任何层贡献 > 10% 的 total host time → 该层**必须**有对应候选
+
+2. **热路径操作审计表**（见 [proactive_source_analysis.md](02_bottleneck_analysis/references/proactive_source_analysis.md)「热路径操作审计表」）：
+   - 审计表中任何维度标记为"是"或"否(不随输入变)"的操作 → 该操作**必须**有对应候选
+   - 用 `parse_op_statistic.py` / `parse_operator_memory.py` 数据量化影响范围，占比 <1% 的可跳过
+
+### 确认节点 B：提交前审核（Phase 4 → Phase 5 之间）
+
+本批优化的精度验证和 profiling 确认均通过后、git commit 前，**必须**向用户展示本批总结并等待确认：
+
+1. 总结本批实施的所有优化点及实际效果（性能数据 + 精度数据）
+2. 列出未采纳的方案及原因
+3. 确认 evidence_db 案例已按 [schema](06_evidence_db/schema.md) 记录到项目工作目录的 `evidence_db/` 下（展示案例文件路径）
+4. 使用 `ask_user_question` 询问用户：
+   - 是否确认提交本批优化
+   - 是否需要回退某些改动
+5. 用户确认后才执行 git commit
+
+> 案例未记录 = 不允许提交。与"精度未通过 = 不允许提交"同等约束力。
+
+### 确认节点 C：继续优化确认（Phase 5 之后）
+
+git commit 完成后，**必须**向用户展示本轮总结并询问是否继续：
+
+1. 展示本轮优化总结（性能提升 + 精度状态）
+2. 展示当前剩余瓶颈（最新 profiling 数据）
+3. 使用 `ask_user_question` 询问用户：是否继续下一轮优化？
+4. 用户确认继续 → 回到 Phase 2 开启下一轮（重新采集 L1）
+5. 用户确认停止 → 结束
 
 ## 子技能索引
 
@@ -91,36 +159,37 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 ## 各阶段要点
 
-**Phase 1 前期准备**：理解模型代码、搭建 NPU 环境、准备测试数据、构建 profiling 采集脚本和精度验证脚本。关键产出：可复现的**基线性能数据（L0 + wall-clock，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
+**Phase 1 前期准备**：理解模型代码、搭建 NPU 环境、准备测试数据、构建 profiling 采集脚本和精度验证脚本。关键产出：可复现的**基线性能数据（L0 采集，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
+
+> L0 基线与各优化阶段 Phase 2 的 L1 是**两次目的不同的采集**：L0 基线只采一次、贯穿全程用于收益对比；L1 每轮迭代前都重新采集、用于定位当轮优化点。级别定义与代码模板见 [01_preparation/SKILL.md](01_preparation/SKILL.md)「采集级别选择」及 [profiling_collection.md](01_preparation/references/profiling_collection.md) §1。
 
 **Phase 2 瓶颈分析**：
-- **新轮次强制重置**：每轮 Phase 2 必须从零开始——重新采集 L1、重新运行分析脚本、重新估算下界。上一轮的分析结论/未实施方案/优化方向全部失效（性能 profile 已变）。
-- **下界分析（先做）**：估算优化空间——读取 L0 Computing 和 L0 Free，判断是否还有空间、还有多少。详见 [bound_analysis.md](references/bound_analysis.md)。
-- **Line B**:采集 **L1**,跑脚本,用两种分析模式定位可见瓶颈。
+- **Line B (先做)**:采集 **L1**(信息不足时改采 **L2**),跑脚本,用五种分析模式定位可见瓶颈。
 - **Line A (必做)**:通读源码(穿透框架),用四维度审视,发现结构性冗余。用 Line B 的数据量化收益。
 - 两条线**都必须执行**,产出合并后进入**确认节点 A**。
 
 **★ 确认节点 A**：向用户展示优化方案清单（每条含内容、预期收益、风险等级），询问方案是否合适、有无需要跳过的优化点。仅实施用户确认的条目。
 
-**Phase 3 优化实施**：根据用户确认的优化清单，用四维度（去重、复用、掩盖、替换）框架选择具体手段。每条优化后进行Level 1 快速精度验证。实施完成后，必须回溯 Phase 2 的所有结构化产出（热路径审计表、归因层 10 类浪费、根因追踪发现），逐行验证每个 actionable 条目是否已实施或附依据排除。详见 [execution_protocol.md](references/execution_protocol.md)「Phase 3 → Phase 4 门禁」。**任何未关闭的条目阻止进入 Phase 4。**
+**Phase 3 优化实施**：根据用户确认的优化清单，用四维度（去重、复用、掩盖、替换）框架选择具体手段。图编译优先尝试，失败后走 eager 路线。每条优化后做 Level 1 快速精度验证。
+
+> **Phase 3 首次 Level 1 前**：`accuracy/validation_plan.yaml` 必须存在且字段完整。该文件定义了每次 Level 1 "对单个样本比什么(Φ)、怎么量(D)、阈值多少"。首次需要 Level 1 时，agent 进入 [04_accuracy_assurance/SKILL.md](04_accuracy_assurance/SKILL.md)「验证方案产出物」完成 plan 设计。
 
 **Phase 4 精度验证 + Profiling 确认**：本批（本轮优化阶段）所有优化完成后，**必须依次完成**：
-1. 全量精度验证（方法论见 [04_accuracy_assurance](04_accuracy_assurance/SKILL.md)）—— 与原始 baseline 对比，确认精度无退化
-2. 重新采集 **wall-clock + L0**（按 Phase 1 相同方法）—— wall-clock 确认真实收益，L0 与基线/上一轮比对确认收益来源（L0 Computing 和 L0 Free 的变化）
+1. 全量精度验证（Level 2）——与原始 baseline 对比，确认精度无退化
+   - 仅改实现（算子替换/图编译/内存优化）→ 数值层
+   - 改了算法（量化/降精度/换 decoder）→ 必须任务层
+   - 两者都改 → 两层都做
+2. 阶段末重新采集 Profiling（**L0** 快速比对）——与 L0 基线/上一轮对比，确认本批优化确实带来性能收益
 3. 两项均通过后才可进入提交流程；任一不通过则回退或调整
 
 **★ 确认节点 B**：向用户展示本批总结（优化点、性能收益、精度数据、未采纳方案），询问是否确认提交。用户确认后才执行 git commit。
 
-**★ 确认节点 C（下一轮决策）**：提交完成后，向用户展示当前状态（累计收益、剩余 gap）并询问是否继续。若继续，**必须作为全新一轮执行**——上一轮的分析结论、未实施方案、优化方向全部作废，不可沿用。原因：优化改变了性能 profile，上一轮的瓶颈可能已不存在或已转移。
-
-**Phase 5 工程化提交**：全部工作在 optimize/ 分支进行，每批一个 commit，用户确认后合入 main。**必须先按 [06_evidence_db/schema.md](06_evidence_db/schema.md) 将本轮优化案例记录到项目工作目录的 `evidence_db/` 下（与 `profiling/` 同级），再执行 git commit**——案例未记录不允许提交（见确认节点 B 第 3 步）。
+**Phase 5 工程化提交**：全部工作在 optimize/ 分支进行，每批一个 commit，用户确认后合入 main。维护优化日志记录每批的优化点、修改、效果和未采纳方案。**必须先按 [06_evidence_db/schema.md](06_evidence_db/schema.md) 将本轮优化案例记录到项目工作目录的 `evidence_db/` 下（与 `profiling/` 同级），再执行 git commit**——案例未记录不允许提交（见确认节点 B 第 3 步）。
 
 ## 迭代退出条件
 
-由用户在确认节点 C 中决定是否继续。agent 应基于下界分析（定义见 [bound_analysis.md](references/bound_analysis.md)）提供量化建议。满足以下**任一**条件时建议停止：
+由用户在确认节点 C 中决定是否继续。以下信息供 agent 在展示时参考：
 
-1. `L0 Free < wall-clock × 10%`——device 几乎不停，优化空间在 device 侧，Python 层优化接近极限
-2. L0 Free > 0 但连续 2 轮优化均 < 2% wall-clock 改进——虽然 Free 仍存在但已无法有效消除
-3. 所有候选被拒绝且无新候选产生
-
-终局判断前必须穷尽 NPU 融合算子库，不能仅看 utilization 数字下结论。
+- 性能是否达到预设目标
+- Profiling 显示剩余瓶颈是否还有优化空间
+- 进一步优化的边际收益是否低于工程维护成本
