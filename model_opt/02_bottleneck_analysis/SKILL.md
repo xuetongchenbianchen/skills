@@ -1,6 +1,6 @@
 ---
-name: npu-bottleneck-analysis
-description: 瓶颈分析：profiling 数据分析 + 源码结构分析双线定位性能瓶颈。当用户需要分析性能瓶颈、查看 profiling 数据、定位慢的根因、或分析源码优化机会时触发。
+name: NPU 瓶颈分析
+description: Phase 2 瓶颈分析。分析昇腾 NPU 性能瓶颈——包含源码结构分析(主动发现结构性冗余)和 Profiling 数据分析(定位可见瓶颈)两条线。当用户要求分析性能、定位瓶颈、查看 profiling 数据、分析源码优化机会时触发。执行前参见根 SKILL.md 全流程。
 ---
 
 # NPU 瓶颈分析
@@ -12,15 +12,17 @@ Phase 2 的分析由两条线驱动,顺序执行:
 | | Line B: Profiling 分析 | Line A: 源码分析 |
 |---|---|---|
 | 起点 | profiling 数据中的异常 | 源码的计算结构 |
-| 发现 | 可见瓶颈(算子慢/空闲/等待) | 结构性问题(可合并/可复用/可预计算/可替换) |
-| 方法 | 分析推理 | 多维度审视源码 |
+| 发现 | 可见瓶颈(算子慢/空闲/等待) | 结构性冗余(可合并/可复用/可预计算) |
+| 方法 | 五种分析模式推理 | 四维度审视源码 |
 
 **执行顺序**:
 
+```
 1. 采集 profiling(同时可开始通读源码)
-2. Line B:跑脚本 → 基于脚本的信息分析进行推理 → 定位可见瓶颈 → 产出候选
-3. Line A:通读源码(穿透框架) → 多维度审视 → 用 Line B 数据量化 → 产出候选
+2. Line B:跑脚本 → 五种模式推理 → 定位可见瓶颈 → 产出候选
+3. Line A:通读源码(穿透框架) → 四维度审视 → 用 Line B 数据量化 → 产出候选
 4. 合并两条线的候选 → ★A 用户确认
+```
 
 **关键约束**:
 - Line B 和 Line A **都必须执行**,不设跳过条件——Line B 覆盖可见瓶颈,Line A 覆盖 profiling 盲区
@@ -33,7 +35,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
 1. 穿透框架层,定位真实的模型实现代码(跳过 generate/pipeline/Module.__call__ 等 wrapper)
 2. 通读推理路径,建立对三层的认知:模型结构(架构组成) → 实现逻辑(数据流/生命周期/控制流) → 算法(计算方法)
 3. 对每个计算逻辑块用四维度提问:去重(有没有多余)?复用(有没有浪费)?掩盖(能不能并行)?替换(有没有更好的写法)?
-4. 命中的优化机会用 profiling 解析的数据进行量化
+4. 命中的优化机会用 profiling 数据量化(op_statistic/operator_memory 确认占比),占比 <1% 的跳过
 5. 产出"源码问题候选清单"(每条含:问题描述 + 源码位置 + 影响范围)
 
 详见 [proactive_source_analysis.md](references/proactive_source_analysis.md)。
@@ -41,44 +43,54 @@ Phase 2 的分析由两条线驱动,顺序执行:
 ## Line B: Profiling 分析
 
 **流程**:
-1. 采集 L1 profiling
-2. **下界分析（前置步骤）**：在跑脚本之前，先估算优化空间。详见 [bound_analysis.md](../references/bound_analysis.md)。
+1. 采集 profiling(L1,不足时 L2)
+2. 跑脚本提取结构化数据(按下方典型工作流顺序)
+3. 用五种分析模式推理:从脚本输出的信号组合中定位瓶颈类型 → 详见 [profiling_to_action.md](references/profiling_to_action.md)
+4. 用桥梁字段从 profiling 跨到源码:定位根因的具体代码位置 → 详见 [profiling_to_source.md](references/profiling_to_source.md) + [source_code_analysis.md](references/source_code_analysis.md)
+5. 确认根因后,归入优化维度(去重/复用/掩盖/替换)
 
-   - 读取 L0 Computing（kernel 执行时间）和 L0 Free（device 空闲时间）。
-   - **优化空间 = L0 Free + L0 Computing 中可压缩的部分**（去重/融合可缩小 Computing）。
-   - **不可压缩下界**通过跨轮次观察 L0 Computing 变化趋势逼近（持续下降说明有空间，连续 2 轮不下降说明到达下界）。
-   - 不在此处判定优化方向——"空间在哪、怎么缩小"由后续 profiling 脚本分析确定。
+**核心原则**:
+- 不要停在"什么慢"——必须追到"为什么慢"(源码根因)
+- 向上追溯调用链(谁调了它、循环几次)
+- 向下深入实现(内部有没有浪费)
+- 区分必要 vs 冗余(同一操作可能既有必要调用也有冗余调用)
 
-3. 运行 `run_analysis.py`（统一入口）提取结构化数据，输出一份按 A~H 节归类的完整报告。报告 A 节自动包含 L0/L1 交叉验证（传入 `--l0-dir` 时对比 L0 和 L1 的 step_trace，未传入时标注"未经交叉验证，须谨慎"）。L0 来源：第 0 轮用 Phase 1 基线 L0；第 i 轮用第 i-1 轮 Phase 4 的 L0。各脚本输出含义详见 [profiling_scripts_guide.md](references/profiling_scripts_guide.md)
-4. **推理与根因追踪（强制，覆盖所有显著发现，不可跳过）**：阅读完整报告后，用 [profiling_to_action.md](references/profiling_to_action.md) 的两种分析模式（横向关联 + 纵向深入）从信号组合定位瓶颈类型（现象→归因），再通过三座桥（Call Stack、Input Shapes、下发时序）从 profiling 数据定位到**源码中的具体代码位置**，沿调用链追溯根因。定位到源码后回答：**这段代码为什么导致了这个 profiling 现象？**
+**深入参考**(按需加载):
+- [host_bound_patterns.md](references/host_bound_patterns.md) — Host-Bound 深度诊断
+- [memory_profiling.md](references/memory_profiling.md) — 显存峰值分析
+- [profiling_scripts_guide.md](references/profiling_scripts_guide.md) — 脚本详细使用指南
 
-   "显著"的判定标准 = 脚本自身输出的 DEFINITE 信号 / WARNING 警告，或占比超过脚本定义的阈值。
+### 瓶颈分类
 
-   **参考示例**（非穷举，仅为说明不同发现类型可能需要不同的追踪路径）：
+| 类型 | Profiling 表现 | 核心问题 |
+|------|---------------|---------|
+| **Host-Bound** | 设备利用率低（Free >> Computing） | host dispatch、Python 开销、同步 |
+| **Compute-Bound** | 利用率高，kernel 耗时大，mac_ratio 高 | 算子本身计算密集 |
+| **Memory-Bound** | 利用率高但 mte_ratio >> mac_ratio | HBM 带宽瓶颈 |
+| **Allocator-Bound** | 类似 Host-Bound 但 empty_tensor 占比高 | allocator 同步阻塞 |
 
-   - 算子开销高（来自 op_statistic / operator_details）→ `--filter <op>` 获取 Call Stack → 追溯到调用该算子的 Python 函数 → 判断是必要计算还是框架内部操作
-   - 设备空闲 / 流间隙（来自 step_trace / trace_view）→ trace_view 的 Host2Device Bound Regions + async_npu flow 回连 cpu_op Call Stack → 定位哪段 Python 代码导致设备等待
-   - Host 开销分类中的"other"占比高（来自 operator_details）→ 该类别是未归类的 host 操作聚合 → 按 host self time 排序找到具体算子 → `--filter` 追 Call Stack
-   - 内存高频抖动（来自 memory_record / operator_memory）→ 重复同尺寸分配列表 → 对应算子的 Call Stack → 定位哪个操作在反复分配/释放
-   - AI_CPU 回退（来自 op_statistic Core Type 分布）→ `--filter <op>` 获取 Input Shapes → 判断 dtype/shape 是否不匹配导致 fallback
+### 强制脚本检查清单（确认节点 A 前必须完成）
 
-   **执行规则**：
-   - 每个脚本运行后，先记录该脚本产出的所有 DEFINITE/WARNING 信号
-   - 对每个信号，选择能将其连接到源码的桥梁（或多桥梁组合），执行根因追踪
-   - 追踪产出格式：`发现来源 | 发现内容 | 使用的桥梁 | 源码位置 | 根因 | 候选方案`
-   - 如果追踪过程中发现了**之前未识别的优化机会**，必须加入候选清单
+> 脚本位于本 skill 的 `scripts/` 目录。以下 `$S` 代表该目录。
+> **每个脚本必须运行**。跳过任何脚本需在确认节点 A 中说明理由。
+> **必读参考**列的文件在运行对应脚本后**必须加载**——不是"按需"，是"绑定"。
 
-   **门禁规则**：
-   - 所有脚本的 DEFINITE 信号和 WARNING 警告全部完成根因追踪后才能进入候选合并
-   - 不得用"这个信号看起来不重要"跳过追踪——脚本的 DEFINITE/WARNING 标记是脚本自身定义的显著性判断，agent 不可覆盖
-   - 追踪到的根因如果是"框架内部操作"，必须进一步追到"是框架的哪段代码导致的"
+| # | 脚本 | 作用 | 必读参考（运行后加载） |
+|---|------|------|---------------------|
+| 1 | `$S/parse_step_trace.py <dir>` | 判断瓶颈侧(host or device) | — |
+| 2 | `$S/parse_op_statistic.py <dir>` | 哪类算子最耗时 | — |
+| 3 | `$S/parse_kernel_details.py <dir>` | 硬件单元、小算子、流水 stall | — |
+| 4 | `$S/parse_trace_view.py <dir>` | host→device 下发链、device 空隙、host2device bound 区段、在线编译 | [host_bound_patterns.md](references/host_bound_patterns.md) |
+| 5 | `$S/parse_operator_details.py <dir>` | Call Stack 定位源码、host self duration | [profiling_to_source.md](references/profiling_to_source.md) |
+| 6 | `$S/parse_memory_record.py <dir>` | 内存峰值、碎片化、高频抖动 | [memory_profiling.md](references/memory_profiling.md) |
+| 7 | `$S/parse_operator_memory.py <dir>` | tensor 生命周期、重复同尺寸分配 | [memory_profiling.md](references/memory_profiling.md) |
 
-5. 确认根因后,产出候选清单(每条含:问题 + 位置 + 影响范围 + 反事实收益上限)。候选评估方法见 [profiling_to_action.md](references/profiling_to_action.md) §候选评估：反事实收益上限。
-
-如需对单个脚本做 `--filter` 深入查询（如 `parse_operator_details --filter Transpose` 获取 Call Stack），可单独调用对应脚本。
+> 多卡场景额外运行 `$S/parse_communication.py <dir>` 分析通信开销（HCCL all-reduce/all-gather 等）。
 
 **门禁规则**：
-- 报告中任何 **DEFINITE** 信号或 **WARNING 警告**（由脚本自身定义，如"严重 Host-Bound"、"AI_CPU Fallback"、"高内存 churn"）**必须**在确认节点 A 中产生对应候选，或附 profiling 数据依据显式排除
+- 每个脚本运行后，写一行发现摘要（如"step_trace: Host-Bound, 利用率 8%"）
+- 脚本输出中的任何 **DEFINITE** 信号或 **⚠ 警告**（由脚本自身定义，如"SEVERE Host-Bound"、"AI_CPU detected"、"高频抖动"）**必须**在确认节点 A 中产生对应候选，或附 profiling 数据依据显式排除
+- 未运行脚本 6-7 时，禁止在候选中包含"allocator/buffer 预分配"类优化（无数据支撑）；运行后若 `memory_profiling.md` 中的模式匹配到脚本输出，则对应优化为必选候选
 
 ## 下一步
 
