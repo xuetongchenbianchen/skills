@@ -2,20 +2,12 @@
 
 Edit values here instead of hunting through individual scripts.
 Loaded via common.threshold(script, key).
-
-NOTE: All numeric thresholds are workload-dependent defaults, not universal
-judgments. Tune per model/framework/chip — e.g., fusible_small_us for LLM decode
-(short kernels) differs from prefill; suspect_mac_ratio baseline differs across
-chip generations. Treat values as starting points, validate against your workload.
 """
 
 THRESHOLDS = {
     "step_trace": {
         "severe_host_bound_util": 20,       # % — below this = severe host-bound
         "moderate_host_bound_util": 50,     # % — below this = moderate host-bound
-        "comm_bound_pct": 20,              # % — Comm(Not Overlapped) above this = Comm-Bound
-        "bubble_severe_pct": 20,           # % — Bubble/Total above this = severe pipeline stall
-        "bubble_moderate_pct": 5,          # % — Bubble/Total above this = moderate pipeline stall
         "step_util_variance": 20,           # % — max-min util difference across steps
         "step_duration_spread": 2.0,        # max/min ratio for step duration outlier
         "large_optimizable_space": 30,      # % — Free/Total above this = large optimizable space
@@ -41,20 +33,15 @@ THRESHOLDS = {
         "block_dim_buckets": [8, 28],       # boundaries: 1, 2-8, 9-28, 29+
         "wait_buckets_us": [100, 500, 2000],# boundaries for wait time distribution
         "cube_low_util": 50,                # % — cube utilization below this = low
-        "low_parallelism_ratio": 0.1,       # ratio — block_dim=1 duration share above this = signal
+        "low_parallelism_ratio": 0.1,       # % — block_dim=1 ratio above this = signal
         "hw_dominance_ratio": 1.5,          # x — mte>mac*1.5 = memory-dominated, vice versa
         "fusible_small_us": 10.0,           # us — kernels below this = fusible candidate
         "fusible_min_length": 5,            # min consecutive small kernels for a sequence
         "fusible_min_total_us": 100,        # us — min cumulative duration for a sequence
-        "compute_bound_mac_ratio": 0.5,     # mac_ratio above this + high dur = true compute-bound (replace/quant target)
         "comm_keywords": [                  # AI_CPU ops that are communication (excluded from fallback)
             "broadcast", "allgather", "alltoall", "allreduce", "hcom", "send", "recv", "reducescatter",
         ],
         "short_kernel_dominant": 60,        # % — short kernel (<20us) ratio above this = dominant
-        "median_wait_threshold_us": 100,   # us — median wait above this = universally high wait
-        "non_nd_format_ratio": 0.1,        # ratio — non-ND input format above this = layout conversion signal
-        "filter_high_wait_multiplier": 3,  # x — wait > avg * this in filter mode = high-wait instance
-        "filter_high_wait_min_us": 200,    # us — minimum wait for filter mode high-wait context
     },
 
     "trace_view": {
@@ -110,26 +97,6 @@ THRESHOLDS = {
         "extreme_hd_ratio": 10,             # x — host > device * this = extreme ratio
         "extreme_host_us": 5000,            # us — host above this for extreme ratio
         "hd_ratio_display_cap": 10000,      # display "∞" above this
-        "aicpu_fallback_min_device_us": 1000, # us — device_us above this for AI_CPU fallback detection
-        "aicpu_fallback_aicore_ratio": 0.5, # ratio — AICore/device below this = AI_CPU fallback
-        "sync_dominance_pct": 20,           # % — sync category above this of total host = dominant
-        "other_breakdown_pct": 10,          # % — other category above this = auto-breakdown
-        # Host category classification rules (C1). Classify by op ROLE, not name —
-        # these patterns are framework defaults, adjust per model/framework. Order
-        # matters: first match wins (sync > alloc > H2D > dispatch-cann > dispatch-aten > framework > compile).
-        # Key: alloc and H2D must come BEFORE dispatch(aten) so that aten::slice
-        # matches alloc (not dispatch) and aten::to matches H2D (not dispatch).
-        "host_category_rules": {
-            "sync (D-to-H)": ["_local_scalar", "::item", ".item", "numpy"],
-            "alloc/metadata": ["empty", "as_strided", "view", "reshape", "clone",
-                               "contiguous", "detach", "expand", "squeeze", "unsqueeze",
-                               "slice", "select", "resize_"],
-            "H2D/D2H copy": ["copy_", "_to_copy", "to_copy", "memcpy", "::to"],
-            "dispatch (CANN aclnn)": ["aclnn"],
-            "dispatch (PyTorch aten)": ["aten::"],
-            "framework/comm": ["c10d::", "profiler", "broadcast_"],
-            "compile": ["compile", "opcompile"],
-        },
     },
 
     "communication": {
@@ -140,10 +107,5 @@ THRESHOLDS = {
         "low_bw_min_size_mb": 1,            # MB — min size for low bandwidth link signal
         "small_packet_mb": 1.0,             # MB — packets below this = small
         "small_packet_ratio": 0.3,          # small packet ratio above this = SIGNAL
-    },
-
-    "api_statistic": {
-        "host_precompute_ratio": 0.2,       # ratio — tiling+workspace / total above this = signal
-        "dominant_category_pct": 20,        # % — dominant API category above this = signal
     },
 }
