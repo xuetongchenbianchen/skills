@@ -429,7 +429,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
         sorted_waits = sorted(all_waits)
         median_wait = sorted_waits[len(sorted_waits) // 2]
         if median_wait > threshold("kernel_details", "median_wait_threshold_us", 100):
-            lines.append(f"  [SIGNAL] Wait time 普遍偏高 (avg={avg_wait:.0f}us, median={median_wait:.0f}us)")
+            lines.append(f"  - Wait time 普遍偏高 (avg={avg_wait:.0f}us, median={median_wait:.0f}us) — 详见 D 节 device stall 分析")
     lines.append("")
 
     # --- 7. 可疑信号（诊断）---
@@ -440,7 +440,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # 7a. 可疑 kernel — 加瓶颈归因
     suspect_sorted = sorted(suspect_heap, key=lambda x: -x[0])
     if suspect_sorted:
-        lines.append("  [SIGNAL] 高 duration、低 compute ratio — 交叉验证: 用 --filter <op> 查看 shape 分布")
+        lines.append("  [FUTURE] 高 duration、低 compute ratio kernel — 需 kernel 级优化（当前框架暂不支持）")
         header = f"  {'Name':<42} {'Core':<5} {'Dur(us)':>8} {'Compute':>8} {'Move':>8} {'BDim':>5} {'Bottleneck':<12} {'Shapes'}"
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
@@ -457,7 +457,8 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # 7a-bis. 真正的 compute-bound kernel（高 duration + 高 compute ratio）
     cb_sorted = sorted(compute_bound_heap, key=lambda x: -x[0])
     if cb_sorted:
-        lines.append("  [SIGNAL] 真正的 compute-bound（高 duration + 高 compute ratio）— replace/quantize/split 目标")
+        cb_items = [f"{name[:35]} {dur:.1f}us mac={mac_ratio:.2f}" for dur, _, name, core, mac_ratio, bdim, shapes in cb_sorted[:3]]
+        lines.append(f"  [SIGNAL] 真正的 compute-bound (replace/quantize 目标): {', '.join(cb_items)}")
         header = f"  {'Name':<42} {'Dur(us)':>8} {'mac':>6} {'BDim':>5} {'Shapes'}"
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
@@ -469,7 +470,7 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     # 7b. 高 wait 上下文 — 按模式聚合
     high_wait_indices = [i for i, k in enumerate(all_kernels) if k["wait"] > wait_threshold]
     if high_wait_indices:
-        lines.append(f"  [SIGNAL] 高 wait kernel (wait > {wait_threshold:.0f}us) — 在 trace_view 中查找原因")
+        lines.append(f"  - 高 wait kernel (wait > {wait_threshold:.0f}us) — 详见 D 节 device stall 分析")
         lines.append("")
         # 按 kernel name 模式聚合
         from collections import Counter as _Counter
@@ -510,8 +511,8 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
     if fusible_sequences:
         fusible_sorted = sorted(fusible_sequences, key=lambda x: -x[0])
         total_fusible = sum(s[0] for s in fusible_sorted)
-        lines.append(f"  [SIGNAL] Fusible 序列: {len(fusible_sorted)} 个序列，每个含 ≥{MIN_LEN} 个连续小 kernel (<{SMALL_THRESH}us)")
-        lines.append(f"    Fusible 序列总耗时: {total_fusible/1000:.2f}ms ({total_fusible/total_dur_us*100:.1f}% 占 compute)")
+        fusible_items = [f"{total/1000:.1f}ms/{count}个" for total, count, start_idx, types, s in fusible_sorted[:3]]
+        lines.append(f"  [SIGNAL] Fusible 序列: {len(fusible_sorted)} 个, 总耗时 {total_fusible/1000:.1f}ms ({total_fusible/total_dur_us*100:.0f}% compute), top: {', '.join(fusible_items)}")
         lines.append(f"    按累计耗时排序的 Top {min(top_k, 5)}:")
         for total, count, start_idx, types, s in fusible_sorted[:5]:
             tc = Counter(types).most_common(3)
@@ -519,6 +520,51 @@ def parse(profiling_dir: str, rank=None, top_k: int = 15,
             lines.append(f"      {total/1000:.2f}ms  {count} 个 kernel  at #{start_idx}  stream={s}  类型: {type_str}")
         lines.append("    - 交叉验证: 检查这些是否能 fuse (equivalent_substitution layer 1) 或 batch。")
         lines.append("")
+
+    # --- FUTURE signals: 算子级诊断（暂不关注，等功能完善后启用）---
+    if aic_kernels > 0 and aic_dur_sum > 0:
+        wmac = aic_mac_wsum / aic_dur_sum
+        wmte = (aic_mte1_wsum + aic_mte2_wsum) / aic_dur_sum
+        wscalar = aic_scalar_wsum / aic_dur_sum
+        lines.append(f"  [FUTURE] AIC 硬件单元: mac={wmac:.3f} mte={wmte:.3f} scalar={wscalar:.3f}")
+    if aiv_kernels > 0 and aiv_dur_sum > 0:
+        wvec = aiv_vec_wsum / aiv_dur_sum
+        wmte2 = (aiv_mte2_wsum + aiv_mte3_wsum) / aiv_dur_sum
+        wscalar = aiv_scalar_wsum / aiv_dur_sum
+        lines.append(f"  [FUTURE] AIV 硬件单元: vec={wvec:.3f} mte={wmte2:.3f} scalar={wscalar:.3f}")
+    if format_counts:
+        total_fmt = sum(format_counts.values())
+        non_nd = sum(c for f, c in format_counts.items() if f != "ND" and f != "N/A")
+        if total_fmt > 0 and non_nd / total_fmt > threshold("kernel_details", "non_nd_format_ratio", 0.1):
+            lines.append(f"  [FUTURE] 非 ND format: {non_nd}/{total_fmt} ({non_nd/total_fmt*100:.0f}%) — layout 转换开销")
+    if cube_total_count > 0:
+        avg_cube = cube_util_wsum / cube_util_dur_sum
+        lines.append(f"  [FUTURE] Cube 利用率: avg={avg_cube:.1f}%, min={cube_util_min:.1f}%, low(<50%)={cube_low_util_count}/{cube_total_count}")
+    if aic_icache_dur_sum > 0:
+        lines.append(f"  [FUTURE] AIC icache miss: avg={aic_icache_wsum/aic_icache_dur_sum:.3f} max={aic_icache_max:.3f}")
+    if aiv_icache_dur_sum > 0:
+        lines.append(f"  [FUTURE] AIV icache miss: avg={aiv_icache_wsum/aiv_icache_dur_sum:.3f} max={aiv_icache_max:.3f}")
+    if block_dim_total_dur > 0:
+        low_par_ratio = block_dim_dur["1"] / block_dim_total_dur
+        if low_par_ratio > threshold("kernel_details", "low_parallelism_ratio", 0.1):
+            lines.append(f"  [FUTURE] Block Dim=1: 占 {low_par_ratio*100:.1f}% 计算时间 — shape 太小无法并行")
+    if op_type_hw:
+        bounds = {"compute": 0, "memory": 0, "scalar": 0, "other": 0}
+        for op_t, hw in op_type_hw.items():
+            if hw["dur_sum"] <= 0:
+                continue
+            compute = (hw["mac_wsum"] + hw["vec_wsum"]) / hw["dur_sum"]
+            memory = hw["mte_wsum"] / hw["dur_sum"]
+            scalar = hw["scalar_wsum"] / hw["dur_sum"]
+            if compute > memory and compute > scalar:
+                bounds["compute"] += 1
+            elif memory > compute and memory > scalar:
+                bounds["memory"] += 1
+            elif scalar > compute and scalar > memory:
+                bounds["scalar"] += 1
+            else:
+                bounds["other"] += 1
+        lines.append(f"  [FUTURE] Per-op bound: compute={bounds['compute']} memory={bounds['memory']} scalar={bounds['scalar']} other={bounds['other']}")
 
     if not suspect_sorted and not cb_sorted and not high_wait_indices and not fusible_sequences:
         lines.append("  无")

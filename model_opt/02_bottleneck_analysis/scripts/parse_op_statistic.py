@@ -121,11 +121,19 @@ def parse(profiling_dir: str, rank=None, top_k: int = 30) -> str:
     # 1. 集中度
     top3_us = sum(r["_total_us"] for r in rows_sorted[:3])
     top3_ratio = top3_us / total_us * 100 if total_us > 0 else 0
-    lines.append(f"- [DEFINITE] Top-3 集中度: 占 device 总耗时 {top3_ratio:.1f}%")
+    top3_names = [f"{r.get('OP Type', '?')} {r['_total_us']/total_us*100:.0f}%" for r in rows_sorted[:3]] if total_us > 0 else []
+    lines.append(f"- [DEFINITE] Top-3 集中度: {top3_ratio:.1f}% ({', '.join(top3_names)})")
     if top3_ratio > threshold("op_statistic", "top3_concentration", 80):
         lines.append(f"  - 瓶颈高度集中 — 优化 top 算子的杠杆效应显著")
 
-    # 2. Data movement overhead
+    # 2. AI_CPU fallback（非通信算子在 AI_CPU 上执行）
+    if aicpu_non_comm:
+        aicpu_total = sum(r["_total_us"] for r in aicpu_non_comm)
+        aicpu_names = [r.get("OP Type", "") for r in aicpu_non_comm[:5]]
+        lines.append(f"- [SIGNAL] AI_CPU 非通信算子 fallback: {len(aicpu_non_comm)} 种, {aicpu_total/1000:.1f}ms, ops: {', '.join(aicpu_names)}")
+        lines.append(f"  - 算子未在 AI Core 上执行。替换为 AI Core 实现或调整 shape/format 避免 fallback")
+
+    # 3. Data movement overhead
     move_keywords = tuple(threshold("op_statistic", "move_keywords",
                                     ["Transpose", "Cast", "Copy", "Contiguous", "Reshape", "MemSet", "Format"]))
     move_us = sum(r["_total_us"] for r in rows_sorted
@@ -135,11 +143,10 @@ def parse(profiling_dir: str, rank=None, top_k: int = 30) -> str:
         move_ops = [r.get("OP Type", "") for r in rows_sorted
                     if any(kw.lower() in r.get("OP Type", "").lower() for kw in move_keywords)
                     and r["_total_us"] > 0]
-        lines.append(f"- [SIGNAL] Data movement overhead: {move_ratio:.1f}% ({move_us/1000:.1f}ms)")
-        lines.append(f"  ops: {', '.join(move_ops[:8])}")
+        lines.append(f"- [SIGNAL] Data movement overhead: {move_ratio:.1f}% ({move_us/1000:.1f}ms), ops: {', '.join(move_ops[:5])}")
         lines.append(f"  - Layout/format 转换开销。交叉验证: 在 kernel_details 中确认 mte 占比，在 operator_details 中定位来源")
 
-    # 3. Core placement 异常：compute 类 op 跑在 AI_VECTOR_CORE 上
+    # 4. Core placement 异常：compute 类 op 跑在 AI_VECTOR_CORE 上
     misplaced = []
     for r in rows_sorted:
         op_type = r.get("OP Type", "")
@@ -148,12 +155,11 @@ def parse(profiling_dir: str, rank=None, top_k: int = 30) -> str:
                 misplaced.append(r)
     if misplaced:
         misplaced_total = sum(r["_total_us"] for r in misplaced)
-        lines.append(f"- [SIGNAL] Compute op 在 AI_VECTOR_CORE 上执行: {len(misplaced)} 种, {misplaced_total/1000:.1f}ms")
-        for r in misplaced[:5]:
-            lines.append(f"  {r.get('OP Type', '?')}: count={r['_count']}, total={r['_total_us']/1000:.1f}ms")
+        misplaced_names = [f"{r.get('OP Type', '?')}({r['_total_us']/1000:.1f}ms)" for r in misplaced[:3]]
+        lines.append(f"- [SIGNAL] Compute op 在 AI_VECTOR_CORE: {len(misplaced)} 种, {misplaced_total/1000:.1f}ms, ops: {', '.join(misplaced_names)}")
         lines.append(f"  - 可能是 shape 不满足 AI_CORE 要求或缺少对应实现。kernel_details --filter <op> 确认 shape + block_dim")
 
-    # 4. 执行离散度异常：Max/Avg > 阈值（同类 op 有异常慢的调用）
+    # 5. 执行离散度异常：Max/Avg > 阈值（同类 op 有异常慢的调用）
     variance_threshold = threshold("op_statistic", "variance_max_avg_ratio", 5.0)
     variance_min_ratio = threshold("op_statistic", "variance_min_total_ratio", 0.01)
     high_variance = []
@@ -162,13 +168,11 @@ def parse(profiling_dir: str, rank=None, top_k: int = 30) -> str:
             if total_us > 0 and r["_total_us"] / total_us > variance_min_ratio:
                 high_variance.append(r)
     if high_variance:
-        lines.append(f"- [SIGNAL] 执行离散度异常 (Max/Avg > {variance_threshold:.0f}x, 且总占比 > {variance_min_ratio*100:.0f}%):")
-        for r in high_variance[:5]:
-            max_avg = r["_max_us"] / r["_avg_us"]
-            lines.append(f"  {r.get('OP Type', '?')}: avg={r['_avg_us']:.1f}us, max={r['_max_us']:.0f}us ({max_avg:.1f}x), count={r['_count']}")
+        var_items = [f"{r.get('OP Type', '?')} {r['_max_us']/r['_avg_us']:.1f}x" for r in high_variance[:3]]
+        lines.append(f"- [SIGNAL] 执行离散度异常 (Max/Avg > {variance_threshold:.0f}x): {', '.join(var_items)}")
         lines.append(f"  - 部分调用远慢于平均（可能是特定 shape 或冷启动）。kernel_details --filter <op> 下钻 shape-performance 相关性")
 
-    # 5. 高频低耗时算子（fragmentation 信号）— 加总量门控
+    # 6. 高频低耗时算子（fragmentation 信号）— 加总量门控
     frag_multiplier = threshold("op_statistic", "frag_count_multiplier", 3)
     frag_max_avg = threshold("op_statistic", "frag_max_avg_us", 10)
     frag_min_ratio = threshold("op_statistic", "frag_min_total_ratio", 0.01)
@@ -180,12 +184,11 @@ def parse(profiling_dir: str, rank=None, top_k: int = 30) -> str:
                       and r["_avg_us"] < frag_max_avg
                       and r["_total_us"] / total_us > frag_min_ratio]
         if fragmented:
-            lines.append(f"- [SIGNAL] 高频低耗时算子（fragmentation）:")
-            for name, count, avg, total in fragmented[:5]:
-                lines.append(f"  {name}: count={count}, avg={avg:.1f}us, total={total/1000:.1f}ms")
+            frag_items = [f"{name} {count}x/{avg:.1f}us" for name, count, avg, total in fragmented[:4]]
+            lines.append(f"- [SIGNAL] 高频低耗时算子 (fragmentation): {', '.join(frag_items)}")
             lines.append(f"  - kernel_details 的 fusible 序列可确认是否时间上连续")
 
-    # 6. 低频高耗时算子（重型单算子）
+    # 7. 低频高耗时算子（重型单算子）
     heavy_max_count = threshold("op_statistic", "heavy_max_count", 10)
     heavy_min_avg = threshold("op_statistic", "heavy_min_avg_us", 100)
     heavy_min_ratio = threshold("op_statistic", "heavy_min_ratio", 0.01)
@@ -195,9 +198,8 @@ def parse(profiling_dir: str, rank=None, top_k: int = 30) -> str:
                  if r["_count"] <= heavy_max_count and r["_avg_us"] > heavy_min_avg
                  and r["_total_us"] / total_us > heavy_min_ratio]
         if heavy:
-            lines.append(f"- [SIGNAL] 重型单次调用算子:")
-            for name, count, avg, total, max_us in heavy[:5]:
-                lines.append(f"  {name}: count={count}, avg={avg:.0f}us, max={max_us:.0f}us, total={total/1000:.1f}ms")
+            heavy_items = [f"{name} avg={avg:.0f}us" for name, count, avg, total, max_us in heavy[:3]]
+            lines.append(f"- [SIGNAL] 重型单次调用算子: {', '.join(heavy_items)}")
             lines.append(f"  - kernel_details --filter <op> 下钻逐实例硬件拆分 + shape 相关性")
 
     lines.append("")

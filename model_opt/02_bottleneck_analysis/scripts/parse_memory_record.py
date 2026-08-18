@@ -295,7 +295,8 @@ def parse(profiling_dir: str, rank=None, num_buckets: int = 20, top_k: int = 10)
     if jumps:
         large_jumps = [j for j in jumps if j[0] > threshold("memory_record", "churn_jump_mb", 50)]
         if len(large_jumps) > threshold("memory_record", "churn_count", 20):
-            lines.append(f"  - [SIGNAL] 高内存 churn: {len(large_jumps)} 次跳变 > 50MB")
+            total_jump_mb = sum(j[0] for j in large_jumps)
+            lines.append(f"  - [SIGNAL] 高内存 churn: {len(large_jumps)} 次跳变 >50MB, 累计 {total_jump_mb:.0f}MB")
             lines.append(f"    operator_memory 中查找重复的等大小 alloc — buffer 复用机会")
             suspects_found = True
 

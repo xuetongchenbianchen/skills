@@ -44,17 +44,18 @@ python <script>.py <profiling_dir> [--rank N] [--top-k K] [--output file.txt]
 
 **输出包含以下部分**：
 
-1. **Core Type 分布**：按 AI_CORE / AI_VECTOR_CORE / AI_CPU 分组统计调用次数、耗时、占比。若有非通信算子落在 AI_CPU 上，标注 [!] 并指向可疑信号。用于在第一步即发现 AI_CPU fallback，不必等 kernel_details。
+1. **Core Type 分布**：按 AI_CORE / AI_VECTOR_CORE / AI_CPU 分组统计调用次数、耗时、占比。若有非通信算子落在 AI_CPU 上，输出 [SIGNAL]。
 
 2. **算子排名表**（`--top-k` 控制显示数量，默认 30）：按总耗时降序列出各算子类型，每行含 **Core Type 缩写**（AIC/AIV/MIX/CPU）、调用次数、总耗时、平均单次耗时、**Max/Avg 比值**（执行离散度）、占比、累计占比。
 
 3. **Suspect Signals**（自动生成，基于排名表的统计特征）：
-   - **Top-3 集中度** [DEFINITE]：集中度高（>80%）意味着优化少数几个算子就能获得显著收益。
-   - **数据搬运开销** [SIGNAL]：Transpose/Cast/Copy 等非计算算子的占比。
+   - **Top-3 集中度** [DEFINITE]：含 top-3 op 名称和占比。集中度高（>80%）意味着优化少数几个算子就能获得显著收益。
+   - **AI_CPU 非通信算子 fallback** [SIGNAL]：含 op 名称和耗时。算子未在 AI Core 上执行。
+   - **数据搬运开销** [SIGNAL]：Transpose/Cast/Copy 等非计算算子的占比，含 op 名称。
    - **Core placement 异常** [SIGNAL]：compute 类算子（MatMul/Conv 等）跑在 AI_VECTOR_CORE 上——可能 shape 不满足 AI_CORE 要求或缺少实现。
-   - **执行离散度异常** [SIGNAL]：Max/Avg > 5x 且总占比 > 1% 的算子，部分调用远慢于平均（特定 shape 或冷启动）。
-   - **高频低耗时算子（fragmentation 信号）** [SIGNAL — 弱信号]：调用次数极多但单次很短，加了**总量门控**（总占比 < 1% 不报）。
-   - **低频高耗时算子（重型算子）** [SIGNAL]：调用少但单次很长。
+   - **执行离散度异常** [SIGNAL]：Max/Avg > 5x 且总占比 > 1% 的算子，含 op 名称和倍数。
+   - **高频低耗时算子（fragmentation 信号）** [SIGNAL]：含 op 名称、count、avg，加了总量门控（总占比 < 1% 不报）。
+   - **低频高耗时算子（重型算子）** [SIGNAL]：调用少但单次很长，含 op 名称和 avg。
 
 **何时使用**：每次拿到新 profiling 后首先运行，快速定位瓶颈类型。
 
@@ -103,7 +104,7 @@ python parse_api_statistic.py /path/to/profiling --top-k 20
 3. **Per-Step Breakdown**：逐 step 列出 Total / Computing / Free / Comm(Not Overlapped) / Bubble / Preparing（按 CSV 中非零列动态展示）和利用率，用于观察是否有某个 step 异常偏离。
 
 4. **Preparing Analysis**（仅当 CSV 中 Preparing 列有值时输出）：对比 Preparing 与 Computing 的平均值。Preparing > Computing 说明 profiler 本身的 trace-writing 开销占主导（Level1 常见），需对比 Level0 采集结果区分真实 host gap 和 profiler 开销。
-5. **Optimization Ceilings**（Amdahl 式）：把本 step 时间拆成 compute floor / host-dispatch ceiling (Free) / communication ceiling (Comm(Not Overlapped))，并展示 Overlapped（已重叠不需额外优化），按上限排序候选优先级；并指向 operator_details（sync/alloc 子类）与 kernel_details（fusible 子类）做更细分解。喂饱确认节点 A 的"理论收益上限"。
+5. **优化优先级**：根据 Free 占比给出分阶段优先级——Free 高时优先降低 host 侧 overhead（dispatch/alloc/sync），Free 低后 Computing 和 Comm 均可能有优化空间。Computing 不是硬下限，可通过去重/fusion/量化降低。指向 operator_details（sync/alloc 子类）与 kernel_details（fusible 子类）做更细分解。
 6. **Suspect Signals**：单步推理也输出（[INFO] 标注单步、variance/spread 信号在多步时才激活）；
    - Step 间利用率波动大（>20% 差距）：部分 step 效率显著低于其他，可能是 warmup 或数据依赖行为
    - Step 间耗时差距大（>2x）：可能有首步编译、动态 shape 或缓存效应
@@ -136,13 +137,14 @@ python parse_step_trace.py /path/to/profiling
 
 4. **Block Dim 分布**：按并行度分桶，duration 加权。
 
-5. **Wait Time 分布**：wait time 分桶 + 普遍偏高检测。
+5. **Wait Time 分布**：wait time 分桶（事实陈述，不含 signal——device stall 分析在 trace_view D 节）。
 
 6. **Suspect Signals**：
-   - 低 compute ratio kernel（附 **Bottleneck 归因列**：mte/scalar/pipeline-bubble，直接指向优化方向）
+   - [FUTURE] 低 compute ratio kernel（附 **Bottleneck 归因列**：mte/scalar/pipeline-bubble）— 需 kernel 级优化，当前框架暂不支持
    - 真 compute-bound kernel（高 mac_ratio，替换/量化目标）
-   - 高 wait kernel（**按模式聚合**，附一个示例上下文）
+   - 高 wait kernel（按模式聚合，附示例上下文——详见 D 节 device stall 分析）
    - 可融合小算子序列（按流分组检测）
+   - [FUTURE] 硬件单元利用率、非 ND format、Cube 利用率、icache miss、Block Dim、Per-op bound 分类 — 算子级诊断
 
 7. **Per-Op-Type 硬件效率**：按 op type 聚合 weighted-avg 的 compute/memory/scalar ratio，标注主导瓶颈。
 
@@ -213,8 +215,8 @@ python parse_memory_record.py /path/to/profiling --buckets 20 --top-k 10
    - **纯 Host Op 分类**：metadata op（Device Total = 0，编译可自动消除）vs dispatch wrapper（Device Self = 0 但 Device Total > 0，正常调用层次）
    - **Host Time by Category**：把 host Self 时间按类别分解（sync D→H / H2D-copy / alloc-metadata / dispatch / other）
    - **Host-Total 路径（编译粒度参考）**：按 Host Total Duration 排序，展示 Self/Total 比例低的 op——编译该 op 可一次性消除所有子 op dispatch
-   - **Host Time by Call-Chain Layer**：按调用链首个项目帧聚合 Host Self
-   - Suspect Signals：纯 host 操作占比过高、host/device ratio 极端的算子
+   - **Host Time by Call-Chain Layer**：按调用链首个项目帧聚合 Host Self（key 为 `filename.py:line`）
+   - Suspect Signals：纯 host 操作占比过高 [DEFINITE]、host/device ratio 极端的算子 [SIGNAL]、热点源码层（top 3 file:line + 占比）[SIGNAL]、编译粒度目标（Self/Total 低的 op）[SIGNAL]
 
 2. **Filter 模式**（`--filter`，核心用法）：
    - 给定算子名，输出该算子所有调用的 Call Stack，按调用位置分组
@@ -285,7 +287,7 @@ python parse_operator_memory.py /path/to/profiling --top-k 20
 5. **Resource Utilization Timeline (counters)**：聚合 counter 事件——per-die HBM Read/Write 带宽、LLC Hit Rate/Throughput、L2/MAC Bw Level、内存占用、AI Core 频率。带宽/cache 命中率时间线是动态判 memory-bound vs compute-bound、定位带宽饱和时刻的依据
 5b. **Stream Concurrency (掩盖维度)**：扫描所有 compute 流的 kernel 区间，统计"同时有 0/1/2+ 流 busy"的时间占比。四维度里"掩盖/重叠"的唯一量化产出——是否有多流并行可挖
 5c. **Idle 成因分解**：联合扫描 device-busy 与 host `AscendCL@` 事件区间，当 device idle 时归因到 host 此刻在做的事（mem-mgmt / sync / compile / launch / residual）。回答"为什么 device idle"——host-bound 的根因定位
-6. **Suspect Signals**：host2device-bound 摘要（[SIGNAL] 概述区段数/host-bound 算子数/最差区段链，引向 §4 看详情）、在线编译分类（**A 类**集中预热期 → `skip_first` 跳过；**B 类**贯穿全程 → 关 jit_compile / 定 shape / 图编译）、预取/预分配候选（`aten::to`/`copy_`/`empty` 等**不换算子**的优化点，**按 call site 聚合**输出）、AI Core 降频、Python GC、频繁 stream 同步
+6. **Suspect Signals**：device stall（[SIGNAL] kernel pair gap 统计 + top pair）、dispatch overhead（[SIGNAL] 预估 dispatch 总量 vs kernel-active）、host2device-bound 摘要（[SIGNAL] 概述区段数/host-bound 算子数/最差区段链，引向 §4 看详情）、在线编译分类（**A 类**集中预热期 → `skip_first` 跳过；**B 类**贯穿全程 → 关 jit_compile / 定 shape / 图编译）、预取/预分配候选（[SIGNAL] `aten::to`/`copy_`/`empty` 等不换算子的优化点，按 call site 聚合）、AI Core 降频、Python GC、频繁 stream 同步、[FUTURE] HBM/LLC 资源利用率
 
 **Filter 模式**（`--filter NAME`）：给定算子名，输出匹配事件的 Call stack 和 Input Dims，直接定位源码位置。
 
@@ -357,8 +359,8 @@ python diff_profiling.py /path/to/before /path/to/after --top-k 20
 
 ## 注意事项
 
-- `run_analysis.py` 生成的报告以**数值概览**开头（时间分解 + L0/L1 对比），信号标记说明（`[DEFINITE]`/`[SIGNAL]`）在此声明一次，各节不重复
-- 所有脚本都输出 **Suspect Signals** 部分——列出有疑点的数据，不做最终判定，由 agent 决定是否深入
+- `run_analysis.py` 生成两段式报告：**总章**（全局优化空间 + 信号清单，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组，首读只需看此章）+ **细节章**（A~H 节完整 statistics，供下钻参考）。信号标记说明在总章声明一次
+- 所有脚本都输出 signal 行（`[DEFINITE]`/`[SIGNAL]`/`[FUTURE]`），由 `run_analysis.py` 提取汇总到总章——列出有疑点的数据，不做最终判定，由 agent 决定是否深入
 - 脚本只负责**数据提取和压缩**，不做优化决策——决策由 agent 结合源码分析完成
 - Call Stack 不做任何过滤，保证信息完整性
 - 对于 `operator_details.csv` 超大文件（>10M 行），脚本耗时约 15-20s 是正常的

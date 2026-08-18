@@ -116,14 +116,11 @@ kernel_meta/
 - 50–200 条，含 warmup（前 N 条不计入统计）
 - 用于优化前后对比 wall-clock 均值和 P95
 
-### Profiling 采集集
+### L1 Profiling 样本
 
-激活不同计算模式，为瓶颈分析提供代表性轨迹。选取标准：
-- 5–10 条，覆盖最短/中位/最长各一条
-- 多推理路径时每个路径至少一条
-- 保存为 `profiling_subset.json`，与性能测试集分开
+从性能测试集中选 1 条生产 shape 分布的中位样本用于 L1 采集。L1 数据量大（可达数 GB）、分析重，只需落在生产主流瓶颈 regime 内即可——同 regime 内的 shape 差异只带来线性缩放，不改变瓶颈画像结构，无需多采。
 
-**两者不可混用**：性能测试集追求统计稳定性；Profiling 集追求路径覆盖性。
+L0 + wall-clock 在性能测试集上跨 shape 采集作为兜底：每轮优化后验证收益时，若某 shape 的 L0 结构（L0 Free / L0 Computing 比例）与主流 regime 质变，或优化收益不符预期，再对该 shape 做 targeted L1。精度校验独立用丰富数据集覆盖多维 shape/content。
 
 ---
 

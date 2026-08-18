@@ -62,6 +62,7 @@ def parse(profiling_dir: str, rank=None) -> str:
     tot = {k: sum(s[k] for s in step_data) for k in agg_keys}
     T = tot["total"]
 
+    _bound_type = None
     if T > 0:
         util = tot["computing"] / T * 100
         comm_pct = tot["comm_not_ovl"] / T * 100
@@ -80,36 +81,40 @@ def parse(profiling_dir: str, rank=None) -> str:
         lines.append("")
 
         if util < threshold("step_trace", "severe_host_bound_util", 20):
+            _bound_type = "严重 Host-Bound"
             lines.append("  ** 严重 Host-Bound: device 空闲 >80%，瓶颈在 host 侧 **")
         elif util < threshold("step_trace", "moderate_host_bound_util", 50):
+            _bound_type = "中度 Host-Bound"
             lines.append("  ** 中度 Host-Bound: device 空闲 >50%，host 侧 overhead 显著 **")
         elif comm_pct > threshold("step_trace", "comm_bound_pct", 20):
+            _bound_type = "Comm-Bound"
             lines.append(f"  ** Comm-Bound: 纯通信占比 {comm_pct:.0f}%，优先 comm-compute overlap / comm 减少 **")
         else:
+            _bound_type = "Device-Bound"
             lines.append(f"  瓶颈在 device 侧（利用率 {util:.0f}%）")
             lines.append(f"  - 需 kernel 级分析区分 compute-bound 和 memory-bound")
         lines.append("")
 
         optimizable = (tot["free"] + tot["comm_not_ovl"]) / T * 100
-        lines.append(f"  理论下限 (= Computing): {tot['computing']/1000:.1f} ms")
-        lines.append(f"  可优化空间: {optimizable:.1f}% ((Free + Comm(Not Overlapped)) / Total)")
+        lines.append(f"  当前 Computing: {tot['computing']/1000:.1f} ms ({tot['computing']/T*100:.1f}%) — 可通过去重/fusion/量化降低")
+        lines.append(f"  当前 Free: {tot['free']/1000:.1f} ms ({free_pct:.1f}%) — host 侧 overhead，可回收")
+        if tot["comm_not_ovl"] > 0:
+            lines.append(f"  当前 Comm(Not Overlapped): {tot['comm_not_ovl']/1000:.1f} ms ({comm_pct:.1f}%) — 可 overlap/消除")
         if optimizable > threshold("step_trace", "large_optimizable_space", 30):
-            lines.append(f"  - 可优化空间大。非 compute 的 overhead（dispatch/alloc/sync/comm）显著；按此上限而非实现难度对候选排序")
+            lines.append(f"  - Free + Comm 占 {optimizable:.0f}%，优先回收 host 侧 overhead")
         lines.append("")
 
-        # 优化上限（C4, Amdahl 式，基于本 step 的时间拆分）
-        lines.append("## 优化上限（按这些对候选排序）")
-        lines.append(f"  Compute 下限（不可低于）:           {tot['computing']/1000:.1f} ms ({tot['computing']/T*100:.1f}%)")
-        lines.append(f"  Host/dispatch 上限（可回收 Free）:  {tot['free']/1000:.1f} ms ({free_pct:.1f}%)")
-        if tot["comm_not_ovl"] > 0:
-            lines.append(f"  Communication 上限（可 overlap/消除）: {tot['comm_not_ovl']/1000:.1f} ms ({comm_pct:.1f}%)")
-        if tot["overlapped"] > 0:
-            lines.append(f"  Overlapped（已重叠，不需额外优化）:   {tot['overlapped']/1000:.1f} ms")
-        if tot["free"] >= tot["comm_not_ovl"] and tot["free"] > 0:
-            lines.append(f"  - 最大上限 = host/dispatch (Free)。优先处理 host 侧问题。")
-        elif tot["comm_not_ovl"] > 0:
-            lines.append(f"  - 最大上限 = communication。优先 comm-compute overlap / comm 减少。")
-        lines.append("  子类别上限（更细拆分）:")
+        # 优化优先级（Free 高时降 Free 为主；Free 低后 Computing 和 Comm 都有空间）
+        lines.append("## 优化优先级")
+        if free_pct > threshold("step_trace", "large_optimizable_space", 30):
+            lines.append(f"  Free 占 {free_pct:.0f}% — 优先降低 host 侧 overhead（dispatch/alloc/sync）")
+            lines.append(f"  Computing 暂非重点，但 Free 降低后需重新评估其优化空间")
+        elif comm_pct > threshold("step_trace", "comm_bound_pct", 20):
+            lines.append(f"  Comm 占 {comm_pct:.0f}% — 优先 comm-compute overlap / comm 减少")
+        else:
+            lines.append(f"  Free 已较低 ({free_pct:.0f}%) — Computing 和 Comm 均可能有优化空间")
+            lines.append(f"  Computing: 去重/fusion/量化；Comm: overlap/消除")
+        lines.append("  子类别拆解:")
         lines.append("    sync vs alloc vs dispatch - operator_details 中 Host Time by Category 部分")
         lines.append("    fusible small-op 节省  - kernel_details 中 Fusible sequences 部分")
         lines.append("")
@@ -214,6 +219,10 @@ def parse(profiling_dir: str, rank=None) -> str:
 
     lines.append("## 可疑信号")
     suspects_found = False
+
+    if _bound_type and T > 0:
+        lines.append(f"  [DEFINITE] {_bound_type} | Computing {tot['computing']/1000:.1f}ms ({tot['computing']/T*100:.0f}%), Free {tot['free']/1000:.1f}ms ({free_pct:.0f}%), 可优化空间 {optimizable:.0f}%")
+        suspects_found = True
 
     if len(step_data) == 1:
         lines.append(f"  [INFO] 单步推理 profile（{len(step_data)} step）— step variance/spread 信号未启用")

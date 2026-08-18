@@ -41,7 +41,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
 ## Line B: Profiling 分析
 
 **流程**:
-1. 采集 L1 profiling
+1. 采集 L1 profiling（使用 Phase 1 选定的生产中位样本，见 [01_preparation/SKILL.md](../01_preparation/SKILL.md) 第四节）
 2. **下界分析（前置步骤）**：在跑脚本之前，先估算优化空间。详见 [bound_analysis.md](../references/bound_analysis.md)。
 
    - 读取 L0 Computing（kernel 执行时间）和 L0 Free（device 空闲时间）。
@@ -49,7 +49,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
    - **不可压缩下界**通过跨轮次观察 L0 Computing 变化趋势逼近（持续下降说明有空间，连续 2 轮不下降说明到达下界）。
    - 不在此处判定优化方向——"空间在哪、怎么缩小"由后续 profiling 脚本分析确定。
 
-3. 运行 `run_analysis.py`（统一入口）提取结构化数据，输出一份按 A~H 节归类的完整报告。报告 A 节自动包含 L0/L1 交叉验证（传入 `--l0-dir` 时对比 L0 和 L1 的 step_trace，未传入时标注"未经交叉验证，须谨慎"）。L0 来源：第 0 轮用 Phase 1 基线 L0；第 i 轮用第 i-1 轮 Phase 4 的 L0。各脚本输出含义详见 [profiling_scripts_guide.md](references/profiling_scripts_guide.md)
+3. 运行 `run_analysis.py`（统一入口）提取结构化数据，输出两段式报告：**总章**（全局优化空间 + 信号清单，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组）+ **细节章**（A~H 节完整 statistics，供下钻参考）。总章自动包含 L0/L1 交叉验证（传入 `--l0-dir` 时对比 L0 和 L1 的 step_trace，未传入时标注"未经交叉验证，须谨慎"）。L0 来源：第 0 轮用 Phase 1 基线 L0；第 i 轮用第 i-1 轮 Phase 4 的 L0。各脚本输出含义详见 [profiling_scripts_guide.md](references/profiling_scripts_guide.md)
 4. **推理与根因追踪（强制，覆盖所有显著发现，不可跳过）**：阅读完整报告后，用 [profiling_to_action.md](references/profiling_to_action.md) 的两种分析模式（横向关联 + 纵向深入）从信号组合定位瓶颈类型（现象→归因），再通过三座桥（Call Stack、Input Shapes、下发时序）从 profiling 数据定位到**源码中的具体代码位置**，沿调用链追溯根因。定位到源码后回答：**这段代码为什么导致了这个 profiling 现象？**
 
    "显著"的判定标准 = 脚本自身输出的 DEFINITE 信号 / WARNING 警告，或占比超过脚本定义的阈值。

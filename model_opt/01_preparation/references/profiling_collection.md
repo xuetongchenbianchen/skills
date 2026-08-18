@@ -21,6 +21,7 @@
 3. **禁止 `export_chrome_trace`**：只产出 trace.json，不产出 `step_trace_time.csv`，无法做 L0/L1 交叉验证和下界分析。必须用 `tensorboard_trace_handler`
 4. **采集与业务分离**：业务推理逻辑封装为函数（如 `run_inference(model, input_data)`），采集脚本只包围这个函数。优化改函数内部，采集脚本不改
 5. **warmup**：推理场景采集前手动预热 3 次（触发编译/缓存），不使用 schedule；训练场景用 `schedule(skip_first=20)` 替代
+6. **输入数据**：L1 采集使用 Phase 1 选定的 1 条生产中位样本（见 [SKILL.md](../SKILL.md) 第四节）；wall-clock 和 L0 在性能测试集上跨 shape 采集。下方模板中的 `input_data` 对应当前测量的输入
 
 ## wall-clock benchmark 模板
 

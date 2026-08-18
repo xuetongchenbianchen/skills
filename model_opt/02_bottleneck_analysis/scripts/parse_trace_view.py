@@ -579,6 +579,10 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
         llc = grouped.get("LLC Hit Rate(%)")
         if llc and llc[1] / (llc[0] or 1) < 0.5:
             L.append(f"  - LLC Hit Rate 均值偏低 ({llc[1]/(llc[0] or 1)*100:.0f}%) — cache-unfriendly 的访问模式。kernel_details 的 mte 占比可交叉确认")
+        if hbm_read and hbm_read[3] > 0:
+            L.append(f"  [FUTURE] HBM Read BW peak={hbm_read[3]:.1f} MB/s — 需 kernel 级优化")
+        if llc and llc[0] > 0:
+            L.append(f"  [FUTURE] LLC Hit Rate avg={llc[1]/llc[0]:.2f} — 需 kernel 级优化")
         L.append("")
     else:
         L.append("  未发现 resource 计数器 (HBM bw / LLC / 利用率时间线不可用).")
@@ -688,9 +692,35 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
     # --- 6. 可疑信号（诊断：compile 分类 + prefetch 候选）---
     sec_num = 6
     has_suspects = bool(acl_compile) or bool(host_prefetch) or bool(runs)
-    if has_suspects or (caps.get("cpu_op", 0) and has_callstack):
+    if has_suspects or (caps.get("cpu_op", 0) and has_callstack) or stall_agg or disp_stats["count"]:
         L.append(f"## {sec_num}. 可疑信号")
         L.append("")
+
+    # Device stall signal
+    if stall_agg:
+        stall_pairs_sorted = sorted(stall_agg.items(), key=lambda x: -x[1][1])
+        total_stall = sum(v[1] for v in stall_agg.values())
+        top3_stall = [(f"{str(p[0])[:20]}→{str(p[1])[:20]}", info[1]/1000000, info[0])
+                      for (p, info) in stall_pairs_sorted[:3]]
+        top3_str = ", ".join(f"{name} {sum_ms:.0f}ms/{cnt}" for name, sum_ms, cnt in top3_stall)
+        L.append(f"  [SIGNAL] Device stall (gap≥{gap_threshold_us:.0f}us): {len(stall_agg)} pair, 累计 {total_stall/1000000:.0f}ms, top: {top3_str}")
+        L.append(f"    - 检查 fusion 机会或 host dispatch 瓶颈")
+        L.append("")
+
+    # Dispatch latency signal
+    if disp_stats["count"] and dev_count > 0:
+        if disp_lat:
+            disp_lat_sorted = sorted(disp_lat)
+            p50 = disp_lat_sorted[len(disp_lat_sorted)//2]
+        else:
+            p50 = disp_stats["sum"] / disp_stats["count"]
+        est_total = dev_count * p50 / 1000000
+        compute_active = sum(v[0] for v in compute_streams.values()) / 1000000
+        if compute_active > 0:
+            ratio = est_total / compute_active * 100
+            L.append(f"  [SIGNAL] Dispatch overhead: {disp_stats['count']:,} 次, 预估 {est_total:.1f}ms ({ratio:.0f}% kernel-active)")
+            L.append(f"    - {'gap>50us 占比高 → 减少 op 数有效' if ratio > 50 else 'dispatch 可接受'}")
+            L.append("")
 
     if runs:
         total_h2d = sum(len(r) for r in runs)
@@ -736,7 +766,7 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
             g["count"] += 1
             g["total_us"] += dn / 1000
             g["names"].add(name)
-        L.append("  [SIGNAL] Prefetch / Prealloc 候选 (H2D copy & alloc ops)")
+        L.append(f"  [SIGNAL] Prefetch / Prealloc 候选 (H2D copy & alloc ops): {len(host_prefetch)} 个, 总计 {sum(dn for dn,_,_ in host_prefetch)/1000:.0f}us")
         L.append("    按 call site 聚合:")
         for stack_key, g in sorted(prefetch_groups.items(), key=lambda x: -x[1]["total_us"]):
             names_str = ", ".join(sorted(g["names"]))
@@ -775,6 +805,7 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
             L.append("    - 可能是 ASCEND_LAUNCH_BLOCKING=1 或显式 sync。检查环境变量与 .item()/.numpy() 用法。")
             L.append("")
 
+    # FUTURE signal: resource utilization diagnostics
     return "\n".join(L)
 
 

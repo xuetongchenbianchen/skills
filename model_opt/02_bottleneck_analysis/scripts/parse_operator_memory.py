@@ -179,10 +179,8 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20,
     repeated = [(key, count) for key, count in size_op_count.items() if count > REPEATED_COUNT]
     repeated.sort(key=lambda x: -x[1])
     if repeated:
-        lines.append("  - [DEFINITE] 重复的等大小分配 (buffer 复用机会):")
-        for key, count in repeated[:8]:
-            name_part, size_part = key.rsplit("|", 1)
-            lines.append(f"    {name_part}: {size_part}KB x {count} 次")
+        rep_items = [f"{key.rsplit('|',1)[0]} {key.rsplit('|',1)[1]}KB×{count}" for key, count in repeated[:4]]
+        lines.append(f"  - [DEFINITE] 重复的等大小分配 (buffer 复用): {', '.join(rep_items)}")
         suspects_found = True
 
     if short_lived_large:

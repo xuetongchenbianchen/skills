@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Profiling 统一分析入口。
 
-按顺序执行所有 parse 脚本，输出一份完整的分析报告。
-报告开头生成 Executive Summary（瓶颈判定 + 关键数字 + 信号汇总）。
+按顺序执行所有 parse 脚本，输出一份两段式分析报告：
+  1. 总章：全局优化空间 + 所有 signal 汇总（渐进披露，首读只需看此章）
+  2. 细节章：各 parse 脚本的完整 statistics 输出（供下钻时参考）
 
 用法:
     python run_analysis.py <L1 profiling 目录> [--l0-dir <L0目录>] [--rank N] [--output 报告路径]
 
 报告结构:
-    Executive Summary（自动生成）
+    总章：优化空间与信号汇总
+      1. 全局优化空间 (step_trace + L0 交叉验证)
+      2. 信号清单 ([DEFINITE] / [SIGNAL] / [FUTURE])
+    --- 以下为细节章，供下钻时参考（首读可跳过）---
     A. 全局视角 (step_trace, + L0 交叉验证)
     B. 设备侧：算子分布 (op_statistic)
     C. 设备侧：Kernel 级详情 (kernel_details)
@@ -22,6 +26,7 @@
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -43,6 +48,8 @@ import parse_communication
 
 DIVIDER = "=" * 70
 SUB_DIVIDER = "-" * 70
+
+_SIGNAL_TAGS = ("[DEFINITE]", "[SIGNAL]", "[FUTURE]")
 
 
 def _extract_step_trace_summary(profiling_dir: str, rank=None):
@@ -71,50 +78,102 @@ def _extract_step_trace_summary(profiling_dir: str, rank=None):
         return None
 
 
-def _build_executive_summary(l1_summary, l0_summary) -> str:
-    """生成数值概览 — 仅包含各节独立做不到的跨脚本信息。"""
-    lines = [SUB_DIVIDER, "--- 数值概览 ---", ""]
+def _extract_signals(text: str, section_label: str) -> list:
+    """从 parse 输出文本中提取 signal 行。
 
-    # 时间分解
-    lines.append("## 时间分解")
+    返回 [(level, section_label, signal_text), ...]
+    level 为 "DEFINITE" / "SIGNAL" / "FUTURE"
+    """
+    signals = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            stripped = stripped[2:]
+        for tag in _SIGNAL_TAGS:
+            if stripped.startswith(tag):
+                level = tag.strip("[]")
+                signals.append((level, section_label, stripped))
+                break
+    return signals
+
+
+def _build_global_optimization_space(l1_summary, l0_summary) -> str:
+    """总章第 1 节：全局优化空间。"""
+    lines = ["## 1. 全局优化空间"]
+
     if l0_summary:
-        lines.append(f"  L0 (真实性能): Total {l0_summary['total_ms']:.1f}ms = "
-                     f"Computing {l0_summary['computing_ms']:.1f}ms ({l0_summary['utilization']:.0f}%) + "
-                     f"Free {l0_summary['free_ms']:.1f}ms ({100-l0_summary['utilization']:.0f}%)"
-                     + (f" + Comm {l0_summary['comm_not_ovl_ms']:.1f}ms" if l0_summary['comm_not_ovl_ms'] > 0 else ""))
+        s = l0_summary
+        lines.append(f"  L0 (真实性能): Total {s['total_ms']:.1f}ms = "
+                     f"Computing {s['computing_ms']:.1f}ms ({s['utilization']:.0f}%) + "
+                     f"Free {s['free_ms']:.1f}ms ({100-s['utilization']:.0f}%)"
+                     + (f" + Comm {s['comm_not_ovl_ms']:.1f}ms" if s['comm_not_ovl_ms'] > 0 else ""))
+
     if l1_summary:
+        s = l1_summary
         if l0_summary:
-            delta_pp = l0_summary["utilization"] - l1_summary["utilization"]
+            delta_pp = l0_summary["utilization"] - s["utilization"]
             if delta_pp > 20:
-                lines.append(f"  L1 (含 profiler): Total {l1_summary['total_ms']:.1f}ms — "
+                lines.append(f"  L1 (含 profiler): Total {s['total_ms']:.1f}ms — "
                              f"profiler 伪影严重 (Utilization 差 {delta_pp:.0f}pp)，瓶颈判定以 L0 为准")
             else:
-                lines.append(f"  L1: Total {l1_summary['total_ms']:.1f}ms, Utilization {l1_summary['utilization']:.1f}% "
+                lines.append(f"  L1: Total {s['total_ms']:.1f}ms, Utilization {s['utilization']:.1f}% "
                              f"(与 L0 差 {delta_pp:.0f}pp，profiler 影响可接受)")
         else:
-            lines.append(f"  L1: Total {l1_summary['total_ms']:.1f}ms = "
-                         f"Computing {l1_summary['computing_ms']:.1f}ms ({l1_summary['utilization']:.0f}%) + "
-                         f"Free {l1_summary['free_ms']:.1f}ms ({100-l1_summary['utilization']:.0f}%)"
-                         + (f" + Comm {l1_summary['comm_not_ovl_ms']:.1f}ms" if l1_summary['comm_not_ovl_ms'] > 0 else ""))
+            lines.append(f"  L1: Total {s['total_ms']:.1f}ms = "
+                         f"Computing {s['computing_ms']:.1f}ms ({s['utilization']:.0f}%) + "
+                         f"Free {s['free_ms']:.1f}ms ({100-s['utilization']:.0f}%)"
+                         + (f" + Comm {s['comm_not_ovl_ms']:.1f}ms" if s['comm_not_ovl_ms'] > 0 else ""))
             lines.append(f"  (无 L0 交叉验证，L1 数字可能含 profiler 伪影)")
-    lines.append("")
 
-    # 信号图例（全局声明一次）
-    lines.append("## 信号标记说明")
-    lines.append("  [DEFINITE] = 可直接行动  |  [SIGNAL] = 异常，需结合其他维度交叉验证")
+    if not l1_summary and not l0_summary:
+        lines.append("  (无法提取 step_trace 数据)")
+
     lines.append("")
+    return "\n".join(lines)
+
+
+def _build_signal_summary(all_signals: list) -> str:
+    """总章第 2 节：信号清单，按 DEFINITE / SIGNAL / FUTURE 分组。"""
+    lines = ["## 2. 信号清单", ""]
+
+    definite = [(sec, txt) for lvl, sec, txt in all_signals if lvl == "DEFINITE"]
+    signal = [(sec, txt) for lvl, sec, txt in all_signals if lvl == "SIGNAL"]
+    future = [(sec, txt) for lvl, sec, txt in all_signals if lvl == "FUTURE"]
+
+    if definite:
+        lines.append("### [DEFINITE] — 可直接行动")
+        for sec, txt in definite:
+            lines.append(f"  {txt}  [{sec}]")
+        lines.append("")
+
+    if signal:
+        lines.append("### [SIGNAL] — 需交叉验证")
+        for sec, txt in signal:
+            lines.append(f"  {txt}  [{sec}]")
+        lines.append("")
+
+    if future:
+        lines.append("### [FUTURE] — 算子级诊断（暂不关注，等功能完善后启用）")
+        for sec, txt in future:
+            lines.append(f"  {txt}  [{sec}]")
+        lines.append("")
+
+    if not definite and not signal and not future:
+        lines.append("  无信号")
+        lines.append("")
 
     return "\n".join(lines)
 
 
-def run_section(title: str, func, *args, **kwargs) -> str:
-    """执行单个 parse 函数，用章节标题包裹输出。"""
+def run_section(title: str, func, *args, **kwargs):
+    """执行单个 parse 函数，返回 (章节文本, signal列表)。"""
     lines = [SUB_DIVIDER, f"--- {title} ---", ""]
     try:
         result = func(*args, **kwargs)
         lines.append(result.rstrip())
     except Exception as e:
-        lines.append(f"[ERROR] {func.__module__}.{func.__name__} failed: {e}")
+        result = f"[ERROR] {func.__module__}.{func.__name__} failed: {e}"
+        lines.append(result)
     lines.append("")
     return "\n".join(lines)
 
@@ -135,107 +194,112 @@ def main():
     l1_dir = args.profiling_dir
     rank = args.rank
 
-    # 提取 step_trace 关键数字（用于 Executive Summary）
+    # 提取 step_trace 关键数字（用于总章全局优化空间）
     l1_summary = _extract_step_trace_summary(l1_dir, rank)
     l0_summary = _extract_step_trace_summary(args.l0_dir, rank) if args.l0_dir else None
 
-    sections = []
-    sections.append(DIVIDER)
-    sections.append("=== Phase 2 Profiling 分析报告 ===")
-    sections.append(f"L1 目录: {l1_dir}")
+    # --- 执行各 parse 脚本，收集输出和 signal ---
+    all_signals = []
+    detail_sections = []
+    section_labels = {}
+
+    # A. 全局视角
+    section_a_text = "[L1] " + parse_step_trace.parse(l1_dir, rank).rstrip()
     if args.l0_dir:
-        sections.append(f"L0 参考目录: {args.l0_dir}")
-    else:
-        sections.append("L0 参考目录: 未提供（L1 结论未经交叉验证，须谨慎）")
-    if rank is not None:
-        sections.append(f"Rank: {rank}")
-    sections.append("")
+        section_a_text += "\n\n[L0] " + parse_step_trace.parse(args.l0_dir, rank).rstrip()
+        section_a_text += "\n\n## L0/L1 交叉验证\n"
+        section_a_text += "  对比 L0（无 profiler 开销的真实性能）和 L1（含 profiler barrier 的详细数据）：\n"
+        section_a_text += "  若 L1 Utilization 显著低于 L0（差 >20pp），瓶颈类型判定以 L0 为准；\n"
+        section_a_text += "  L1 的算子级数据（op_statistic、kernel_details 等）仍然有效。"
+    all_signals.extend(_extract_signals(section_a_text, "A"))
+    detail_sections.append(f"{SUB_DIVIDER}\n--- A. 全局视角 ---\n\n{section_a_text}\n")
 
-    # --- 各节内容生成 ---
+    # B. 设备侧：算子分布
+    sec_b = run_section("B. 设备侧：算子分布", parse_op_statistic.parse, l1_dir, rank)
+    all_signals.extend(_extract_signals(sec_b, "B"))
+    detail_sections.append(sec_b)
 
-    # --- A. 全局视角 ---
-    section_a = [SUB_DIVIDER, "--- A. 全局视角 ---", ""]
+    # C. 设备侧：Kernel 级详情
+    sec_c = run_section("C. 设备侧：Kernel 级详情", parse_kernel_details.parse, l1_dir, rank)
+    all_signals.extend(_extract_signals(sec_c, "C"))
+    detail_sections.append(sec_c)
 
-    section_a.append("[L1] " + parse_step_trace.parse(l1_dir, rank).rstrip())
-
-    if args.l0_dir:
-        section_a.append("")
-        section_a.append("[L0] " + parse_step_trace.parse(args.l0_dir, rank).rstrip())
-        section_a.append("")
-        # 结构化 L0/L1 交叉验证对比
-        section_a.append("## L0/L1 交叉验证")
-        section_a.append("  对比 L0（无 profiler 开销的真实性能）和 L1（含 profiler barrier 的详细数据）：")
-        section_a.append("  若 L1 Utilization 显著低于 L0（差 >20pp），瓶颈类型判定以 L0 为准；")
-        section_a.append("  L1 的算子级数据（op_statistic、kernel_details 等）仍然有效。")
-
-    section_a.append("")
-    sections.append("\n".join(section_a))
-
-    # --- B. 设备侧：算子分布 ---
-    sections.append(run_section(
-        "B. 设备侧：算子分布",
-        parse_op_statistic.parse, l1_dir, rank,
-    ))
-
-    # --- C. 设备侧：Kernel 级详情 ---
-    sections.append(run_section(
-        "C. 设备侧：Kernel 级详情",
-        parse_kernel_details.parse, l1_dir, rank,
-    ))
-
-    # --- D. Host-Device 交互 ---
+    # D. Host-Device 交互
     ascend_dir = find_ascend_profiler_output(l1_dir, rank)
     trace_view_path = ascend_dir / "trace_view.json"
     if trace_view_path.exists():
-        sections.append(run_section(
-            "D. Host-Device 交互",
-            parse_trace_view.parse, trace_view_path, 15, 50.0,
-        ))
+        sec_d = run_section("D. Host-Device 交互", parse_trace_view.parse, trace_view_path, 15, 50.0)
     else:
-        sections.append(f"{SUB_DIVIDER}\n--- D. Host-Device 交互 ---\n\n[trace_view] File not found: {trace_view_path}\n")
+        sec_d = f"{SUB_DIVIDER}\n--- D. Host-Device 交互 ---\n\n[trace_view] File not found: {trace_view_path}\n"
+    all_signals.extend(_extract_signals(sec_d, "D"))
+    detail_sections.append(sec_d)
 
-    # --- E. 源码定位 ---
-    sections.append(run_section(
-        "E. 源码定位",
-        parse_operator_details.parse_overview, l1_dir, rank,
-    ))
+    # E. 源码定位
+    sec_e = run_section("E. 源码定位", parse_operator_details.parse_overview, l1_dir, rank)
+    all_signals.extend(_extract_signals(sec_e, "E"))
+    detail_sections.append(sec_e)
 
-    # --- F. 内存 ---
-    section_f = [SUB_DIVIDER, "--- F. 内存 ---", ""]
+    # F. 内存
+    sec_f_lines = [SUB_DIVIDER, "--- F. 内存 ---", ""]
     try:
-        section_f.append(parse_memory_record.parse(l1_dir, rank).rstrip())
+        sec_f_lines.append(parse_memory_record.parse(l1_dir, rank).rstrip())
     except Exception as e:
-        section_f.append(f"[ERROR] parse_memory_record failed: {e}")
-    section_f.append("")
+        sec_f_lines.append(f"[ERROR] parse_memory_record failed: {e}")
+    sec_f_lines.append("")
     try:
-        section_f.append(parse_operator_memory.parse(l1_dir, rank).rstrip())
+        sec_f_lines.append(parse_operator_memory.parse(l1_dir, rank).rstrip())
     except Exception as e:
-        section_f.append(f"[ERROR] parse_operator_memory failed: {e}")
-    section_f.append("")
-    sections.append("\n".join(section_f))
+        sec_f_lines.append(f"[ERROR] parse_operator_memory failed: {e}")
+    sec_f_lines.append("")
+    sec_f = "\n".join(sec_f_lines)
+    all_signals.extend(_extract_signals(sec_f, "F"))
+    detail_sections.append(sec_f)
 
-    # --- G. CANN 运行时 ---
-    sections.append(run_section(
-        "G. CANN 运行时",
-        parse_api_statistic.parse, l1_dir, rank,
-    ))
+    # G. CANN 运行时
+    sec_g = run_section("G. CANN 运行时", parse_api_statistic.parse, l1_dir, rank)
+    all_signals.extend(_extract_signals(sec_g, "G"))
+    detail_sections.append(sec_g)
 
-    # --- H. 通信（仅多卡）---
+    # H. 通信（仅多卡）
     comm_path = ascend_dir / "communication.json"
     matrix_path = ascend_dir / "communication_matrix.json"
     if comm_path.exists():
-        sections.append(run_section(
-            "H. 通信（多卡）",
-            parse_communication.parse, comm_path, matrix_path, 15,
-        ))
+        sec_h = run_section("H. 通信（多卡）", parse_communication.parse, comm_path, matrix_path, 15)
+        all_signals.extend(_extract_signals(sec_h, "H"))
+        detail_sections.append(sec_h)
 
-    sections.append(DIVIDER)
+    # --- 组装报告 ---
+    report_parts = []
+    report_parts.append(DIVIDER)
+    report_parts.append("=== Phase 2 Profiling 分析报告 ===")
+    report_parts.append(f"L1 目录: {l1_dir}")
+    if args.l0_dir:
+        report_parts.append(f"L0 参考目录: {args.l0_dir}")
+    else:
+        report_parts.append("L0 参考目录: 未提供（L1 结论未经交叉验证，须谨慎）")
+    if rank is not None:
+        report_parts.append(f"Rank: {rank}")
+    report_parts.append("")
 
-    # 生成数值概览
-    exec_summary = _build_executive_summary(l1_summary, l0_summary)
+    # 总章
+    report_parts.append(DIVIDER)
+    report_parts.append("=== 总章：优化空间与信号汇总 ===")
+    report_parts.append(DIVIDER)
+    report_parts.append("")
+    report_parts.append(_build_global_optimization_space(l1_summary, l0_summary))
+    report_parts.append(_build_signal_summary(all_signals))
 
-    # 最终报告: 数值概览在报告头之后
-    report = "\n".join(sections[:5]) + "\n" + exec_summary + "\n" + "\n".join(sections[5:])
+    # 细节章
+    report_parts.append(DIVIDER)
+    report_parts.append("=== 以下为细节章，供下钻时参考（首读可跳过）===")
+    report_parts.append(DIVIDER)
+    report_parts.append("")
+    for sec in detail_sections:
+        report_parts.append(sec)
+
+    report_parts.append(DIVIDER)
+
+    report = "\n".join(report_parts)
 
     # 确定输出路径
     if args.output:

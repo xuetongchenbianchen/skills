@@ -20,6 +20,7 @@
 
 import argparse
 import heapq
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -101,7 +102,8 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         frames = _parse_call_stack(row.get("Call Stack", ""))
         proj_frame = next((f for f in frames if not any(m in f for m in _LIB_MARKERS)), None)
         if proj_frame:
-            key = proj_frame[:90]
+            m = re.search(r'([^/]+\.py)\((\d+)\)', proj_frame)
+            key = f"{m.group(1)}:{m.group(2)}" if m else proj_frame[:90]
             layer_agg[key]["host_us"] += host_dur
             layer_agg[key]["count"] += 1
 
@@ -175,6 +177,7 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
 
     # --- Host Total 路径（编译粒度参考）---
     # Host Total 展示哪些高层 op 包含了最多的子 op 开销——这些是好的编译粒度目标
+    interesting = []
     op_with_total = [(name, info) for name, info in op_sorted_host
                      if info["host_total_us"] > 0 and info["host_total_us"] > info["host_us"] * 1.5]
     if op_with_total:
@@ -236,13 +239,31 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
         lines.append(f"    - Framework/dispatch overhead 是主要 host 瓶颈")
         suspects_found = True
 
+    # Call-chain 层归因：热点源码位置（Line A 入口）
+    if layer_agg:
+        layers_sorted_sig = sorted(layer_agg.items(), key=lambda x: -x[1]["host_us"])
+        top_layers = layers_sorted_sig[:3] if layers_sorted_sig else []
+        if top_layers:
+            layer_summaries = [f"{f} ({info['host_us']/total_host_us*100:.0f}%)"
+                              for f, info in top_layers]
+            lines.append(f"  - [SIGNAL] 热点源码层: {', '.join(layer_summaries)}")
+            lines.append(f"    - Line A 源码分析入口，这些位置占 host 时间 >10%")
+            suspects_found = True
+
+    # Host-total 编译目标
+    if interesting:
+        compile_targets = [f"{name} (Self%={info['host_us']/info['host_total_us']*100:.0f}%, Total={info['host_total_us']/1000:.0f}ms)"
+                          for name, info in interesting[:3]]
+        lines.append(f"  - [SIGNAL] 编译粒度目标: {', '.join(compile_targets)}")
+        lines.append(f"    - Self/Total 低 = 编译该 op 可一次性消除子 op dispatch")
+        suspects_found = True
+
     high_ratio = [(name, info) for name, info in op_sorted_host
                   if info["host_us"] > info["device_us"] * threshold("operator_details", "extreme_hd_ratio", 10) and info["host_us"] > threshold("operator_details", "extreme_host_us", 5000)
                   and info["device_us"] > 0]
     if high_ratio:
-        lines.append(f"  - [SIGNAL] host/device 比例极端的 op (host > 10x device, host > 5ms):")
-        for name, info in high_ratio[:5]:
-            lines.append(f"    {name}: host={info['host_us']/1000:.1f}ms vs device={info['device_us']/1000:.1f}ms")
+        ratio_items = [f"{name}: {info['host_us']/1000:.1f}ms/{info['device_us']/1000:.1f}ms" for name, info in high_ratio[:3]]
+        lines.append(f"  - [SIGNAL] host/device 极端比 op (host >10x device): {', '.join(ratio_items)}")
         lines.append(f"    用 --filter <op> 查看 Call Stack 源码位置，trace_view 查看 host dispatch 积压")
         suspects_found = True
 
