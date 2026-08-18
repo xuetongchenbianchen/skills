@@ -42,6 +42,8 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
 | [npu_checklist.md](references/npu_checklist.md) | 始终加载 | NPU 已知性能陷阱的 grep 扫描清单 |
 | [npu_operator_catalog.yaml](references/npu_operator_catalog.yaml) | 替换维度层 1 时加载 | 融合算子目录（被 equivalent_substitution.md 引用） |
 | [compilation_tools.md](references/compilation_tools.md) | host-bound 时 | TorchScript/jit.trace/torch.compile(npu)/NPU JIT 的选择决策树、兼容性排查、编译粒度决策 |
+| [decode_optimization.md](references/decode_optimization.md) | 自回归 decode 场景 | 每步 token 生成的框架开销/内存优化（精简 decode 循环、KV cache 预分配） |
+| [comm_optimization.md](references/comm_optimization.md) | 通信成为瓶颈时（多卡） | 通信原语选择、通信-计算重叠（并行 infra 搭建后参考） |
 | [parallel_design.md](references/parallel_design.md) | 多卡并行场景 | 切分维度选择、通信原语选型、并行区域设计 |
 
 ## 通用原则
