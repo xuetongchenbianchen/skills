@@ -27,6 +27,30 @@ Phase 2 的分析由两条线驱动,顺序执行:
 - Line B 先做(脚本快,秒出结果),其数据供 Line A 做量化
 - 两条线的产出都是"问题定位"(问题 + 位置 + 影响范围),不是方案
 
+## Line C: OOM/容量分诊（条件触发）
+
+Line C 是 Phase 2 的**条件第三线**，仅当 profiling 或用户报告提示显存容量问题时触发。Line A/B 仍然必做，不受 Line C 影响。
+
+**触发条件**（满足任一即触发）：
+1. `parse_operator_memory.py` 的 Parallelism Trigger 报告"消除 waste 后投影峰值仍 > 80% HBM"
+2. 用户直接报告 OOM / 显存不足 / 需要多卡
+
+**执行内容**：按 [analysis_workflow.md](../07_parallel_splitting/references/analysis_workflow.md)（Phase 0 节）的决策树执行 OOM 根因分诊：
+
+1. **外部因素排查**：按 Phase 0 清单逐项检查（attention 融合算子 / 内存碎片 / 序列与 batch 配置 / 通信 buffer 未释放 / 混合精度 / 环境配置），命中即修复终止
+2. **理论显存估算**：agent 读模型源码，按 Phase 0 公式与参考值表计算（如蛋白质 `pair + 9c×L² + 常驻`）
+3. **触发判定**：按 Phase 0 触发条件判定"本质需要并行"或"仍有外部因素"
+
+**分支判定**：
+
+| 分诊结果 | 后续动作 |
+|---------|---------|
+| 外部因素命中（FA 未开 / 碎片化 / 配置不当等） | 指出并修复，不触发切分，继续 Line A/B 正常流程 |
+| 本质需要并行（理论峰值 > HBM × 0.8） | 进入 [07_parallel_splitting/SKILL.md](../07_parallel_splitting/SKILL.md) 全流程，其分析阶段（Steps 1-4）替代/补充 Line A/B 的候选产出 |
+| 延迟不达标但单卡可放下（非 OOM） | 不进入并行切分，回到 Line A/B 做单卡优化 |
+
+> **最典型假性 OOM**：注意力分数未用 FlashAttention/Fusion_Attention，导致 score 张量实体化。先排除外部因素，再谈切分。详见 [analysis_workflow.md](../07_parallel_splitting/references/analysis_workflow.md) Phase 0 节。
+
 ## Line A: 源码分析
 
 **流程**:
