@@ -1,6 +1,6 @@
 # 多卡分布式训练 Profiling 数据分析指南
 
-基于五阶段分层分析方法：从"全局粗筛"到"微观根因"，帮助在海量多卡 profiling 数据中
+基于四阶段分层分析方法：从"全局粗筛"到"微观根因"，帮助在海量多卡 profiling 数据中
 快速定位慢卡、识别瓶颈类型（I/O/CPU/计算/通信），并给出具体优化方向。
 
 **核心原则**：多卡训练中，平均吞吐量没有意义。木桶效应决定整体速度取决于最慢的那张卡。
@@ -24,7 +24,7 @@
    |      |- 是 Compute? -> 查 Roofline (kernel_details)
    |      |- 是 Host? -> 查 JIT/同步/GC (operator_details/trace_view)
    |
-   +-- 4. MoE 专项 (parse_multi_rank.py Phase 5)
+   +-- 4. MoE 专项 (parse_multi_rank.py Phase 4)
           |- 查 AlltoAll Token 分布 -> 调负载均衡
 ```
 
@@ -151,7 +151,7 @@
 三级队列状态检查：
 1. Device Queue 空 → NPU 空转等数据 → 进 2
 2. Host Queue 空 → CPU 处理跟不上 → 查 DataLoader `num_workers`（若 = 1，提升至 CPU 核心数附近如 8~16）；检查是否从压缩包（zip/tar）读取，建议转为直接读取裸文件
-3. Data Queue 空 → 存储读取慢 → 查远端存储（NAS/HDFS/网络挂载盘）；千卡训练强烈建议预处理数据并存入本地 NVMe SSD
+3. Data Queue 空 → 存储读取慢 → 查远端存储（NAS/HDFS/网络挂载盘）；建议预处理数据并存入本地 NVMe SSD
 
 **搬移瓶颈**（Host → Device）：检查是否启用 `pin_memory=True`（PyTorch 的 `pin_memory` 参数），以启用 DMA 加速 H2D 搬移。
 
@@ -166,29 +166,7 @@
 - Python GC：gc.collect 暂停（大模型 25% 性能波动可能由 GC 引起）
 - CPU 资源抢占：监控进程/绑核竞争
 
-## Phase 4: 大规模集群 (>1000 卡)
-
-> Phase 4 需要 >1000 卡场景，`parse_multi_rank.py` 不直接覆盖。
-> 以下为人工排查指南。
-
-**核心原则**：千卡以上，"方差"比"均值"重要 100 倍。
-
-### 吞吐量分布
-
-绘制所有卡的 MFU 散点图。明显离群低点（如单卡 10 TFLOPS 而平均 85 TFLOPS）
-直接判定为硬件故障，无需软件 Profiling。
-
-### 硬件亚健康检测清单
-
-- 端口振荡：查网络接口 UP/DOWN 日志
-- 光模块故障：查 RDMA 链路误码率 (BER)
-- 内存 ECC 纠错：查 HBM ECC 校正计数
-- 散热降频：查核心温度是否超 85°C
-
-**决策建议**：硬件亚健康节点直接隔离下线维修，不尝试软件 Workaround。
-日志写入改为本地存储减少网络 I/O 干扰。
-
-## Phase 5: MoE / AlltoAll 专项分析
+## Phase 4: MoE / AlltoAll 专项分析
 
 传统 AllReduce 分析模型不适用于 AlltoAll 和 Expert Parallelism。
 
@@ -200,7 +178,7 @@ AlltoAll 耗时久时，先别急着查网络：
    导致所有卡在 AlltoAll 同步点等待
 3. **指标**：AlltoAll 总耗时跨 rank 的 CV > 0.2 = 负载不均瓶颈
 
-`parse_multi_rank.py` Phase 5 自动检测 alltoall kernel 跨 rank 耗时方差。
+`parse_multi_rank.py` Phase 4 自动检测 alltoall kernel 跨 rank 耗时方差。
 
 ### 优化方向
 
@@ -220,7 +198,7 @@ AlltoAll 耗时久时，先别急着查网络：
 | Phase 3.3 计算分析 | `parse_multi_rank.py` Phase 3.3 | 跨 rank 算子 CV > 20% |
 | Phase 3.3 Roofline | `parse_kernel_details.py` | mac_ratio, mte_ratio, AICPU fallback |
 | Phase 3.1-3.2 Host | `parse_operator_details.py`, `parse_trace_view.py` | Host self time, JIT, GC, sync |
-| Phase 5 MoE | `parse_multi_rank.py` Phase 5 | AlltoAll CV > 0.2 = 负载不均 |
+| Phase 4 MoE | `parse_multi_rank.py` Phase 4 | AlltoAll CV > 0.2 = 负载不均 |
 
 ## 阈值速查
 

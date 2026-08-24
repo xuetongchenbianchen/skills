@@ -21,7 +21,7 @@
 | `parse_operator_memory.py` | `operator_memory.csv` | ~10K 行 | 内存分配热点 |
 | `parse_communication.py` | `communication.json` + `communication_matrix.json` | — | 多卡通信分析：时间分解、带宽、等待占比 |
 | `parse_trace_view.py` | `trace_view.json` | 4MB-1GB+ | 时序：host→device 下发链、device 空隙、在线编译停顿、Call stack 源码栈 |
-| `parse_multi_rank.py` | 跨所有 rank 的 `step_trace` + `communication` + `op_statistic` + `communication_matrix` + `kernel_details` | — | 多卡五阶段分层分析：Phase 1 慢卡定位+通信域推断、Phase 2 重叠分析、Phase 3 R_wait+小包/对齐、Phase 5 AlltoAll/MoE 负载不均衡 |
+| `parse_multi_rank.py` | 跨所有 rank 的 `step_trace` + `communication` + `op_statistic` + `communication_matrix` + `kernel_details` | — | 多卡四阶段分层分析：Phase 1 慢卡定位+通信域推断、Phase 2 重叠分析、Phase 3 R_wait+小包/对齐、Phase 4 AlltoAll/MoE 负载不均衡 |
 | `diff_profiling.py` | 两份 profiling 目录 | — | 对比两次采集的算子耗时和内存变化 |
 
 ## 通用调用方式
@@ -339,7 +339,7 @@ python parse_communication.py /path/to/profiling --rank 0 --top-k 15
 
 **输入**：多卡 profiling 目录（包含 `rank_0/` ~ `rank_N/` 子目录），跨所有 rank 的 `step_trace_time.csv`、`communication.json`、`op_statistic.csv`、`communication_matrix.json`、`kernel_details.csv`
 
-**定位**：多卡场景的核心分析工具，基于五阶段分层分析方法论（详见 [multi_rank_analysis_guide.md](multi_rank_analysis_guide.md)）。`parse_communication.py` 分析单 rank 的通信，本脚本跨所有 rank 对比，从"全局粗筛"到"微观根因"分层定位瓶颈。
+**定位**：多卡场景的核心分析工具，基于四阶段分层分析方法论（详见 [multi_rank_analysis_guide.md](multi_rank_analysis_guide.md)）。`parse_communication.py` 分析单 rank 的通信，本脚本跨所有 rank 对比，从"全局粗筛"到"微观根因"分层定位瓶颈。
 
 **输出包含（按 Phase 顺序）**：
 
@@ -373,7 +373,7 @@ python parse_communication.py /path/to/profiling --rank 0 --top-k 15
    - **小包分析**：检测 < 32MB 的传输占比（来自 communication.json Size Distribution）
    - **字节对齐检查**：非 512B 对齐的 link（HCCS 硬性要求，带宽可能腰斩）
 
-**Phase 5: MoE / AlltoAll 专项**
+**Phase 4: MoE / AlltoAll 专项**
 7. **AlltoAll 负载不均衡检测**：从 kernel_details.csv 提取 alltoall kernel 跨 rank 对比。
    - [DEFINITE] AlltoAll 总耗时跨 rank CV > 0.2 = 负载不均（Expert Imbalance）
    - AlltoAll Input Shapes 跨 rank 对比（定位 Token 分布差异）

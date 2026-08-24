@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """跨 Rank 对比分析 — 多卡 profiling 的分层分析工具。
 
-基于五阶段方法论实现:
+基于四阶段方法论实现:
   Phase 1: 全局扫描与慢卡定位 — (T_max-T_avg)/T_avg 慢卡检测、通信域推断
   Phase 2: 时间线分解与并行效率 — 计算-通信重叠率、假性重叠检测
   Phase 3: 深度根因定位 — 通信 R_wait 同步等待比例、小包/对齐分析、算子跨 rank 方差
-  Phase 4: 大规模集群 — (Phase 4 需 >1000 卡，本脚本不直接覆盖)
-  Phase 5: MoE/AlltoAll 负载不均衡检测 — Token 分布 CV 分析
+  Phase 4: MoE/AlltoAll 负载不均衡检测 — Token 分布 CV 分析
 
 当多卡 profiling 目录包含 rank_0 ~ rank_N 子目录时，本脚本跨所有 rank
 提取并对比 step_trace、communication、op_statistic、communication_matrix、
@@ -193,7 +192,7 @@ def _load_alltoall_shapes(ascend_dir):
     """Extract alltoall kernel Input Shapes from kernel_details.csv.
 
     Returns list of (name, input_shapes_str, duration_us) for alltoall-related kernels.
-    Used for MoE load imbalance detection (Phase 5).
+    Used for MoE load imbalance detection (Phase 4).
     """
     from common import stream_csv
     csv_path = ascend_dir / "kernel_details.csv"
@@ -365,7 +364,7 @@ def _section_parallel_strategy(ranks_data, top_k):
                           "不同 rank 执行不同分片，同一 TP 组内可对比"))
     if "alltoall" in all_types:
         strategies.append(("EP (专家并行) / SP (序列并行)", "alltoall",
-                          "MoE 场景 — 需检查 Token 分布是否均衡 (见 Phase 5)"))
+                          "MoE 场景 — 需检查 Token 分布是否均衡 (见 Phase 4)"))
     # Check P2P (send/recv) from communication.json
     has_p2p = False
     for _, d in ranks_data:
@@ -819,12 +818,12 @@ def _section_comm_matrix(ranks_data, top_k):
     return "\n".join(L)
 
 
-# === AlltoAll / MoE 负载不均衡检测 (Phase 5) ===
+# === AlltoAll / MoE 负载不均衡检测 (Phase 4) ===
 
 def _section_alltoall_load(ranks_data, top_k):
-    """Phase 5: AlltoAll/MoE load imbalance detection via cross-rank shape/duration comparison."""
+    """Phase 4: AlltoAll/MoE load imbalance detection via cross-rank shape/duration comparison."""
     L = []
-    L.append("# Phase 5: AlltoAll / MoE 负载不均衡检测")
+    L.append("# Phase 4: AlltoAll / MoE 负载不均衡检测")
     L.append("")
     L.append("  传统 AllReduce 分析模型不适用于 AlltoAll 和 Expert Parallelism。")
     L.append("  AlltoAll 耗时久时，先查各卡处理的 Token 数量分布是否均衡。")
@@ -1010,7 +1009,7 @@ def parse(profiling_dir: str, top_k: int = 15, include_signals: bool = True) -> 
     sections.append(("Phase3.4 Matrix", sec6))
     L.append(sec6)
 
-    # Phase 5: AlltoAll / MoE
+    # Phase 4: AlltoAll / MoE
     sec7 = _section_alltoall_load(ranks_data, top_k)
     sections.append(("Phase5 AlltoAll", sec7))
     L.append(sec7)

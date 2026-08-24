@@ -81,7 +81,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
 
 ### 多卡场景专项分析
 
-当 profiling 目录包含 `rank_0/` ~ `rank_N/` 子目录时，`run_analysis.py` 自动检测并运行 Section I（`parse_multi_rank.py`），跨所有 rank 对比分析。多卡分析遵循五阶段方法论，详见 [multi_rank_analysis_guide.md](references/multi_rank_analysis_guide.md)：
+当 profiling 目录包含 `rank_0/` ~ `rank_N/` 子目录时，`run_analysis.py` 自动检测并运行 Section I（`parse_multi_rank.py`），跨所有 rank 对比分析。多卡分析遵循四阶段方法论，详见 [multi_rank_analysis_guide.md](references/multi_rank_analysis_guide.md)：
 
 1. **Phase 1 慢卡定位**：`(T_max-T_avg)/T_avg > 10%` = Tail Card；通信域推断（DP/TP/PP/EP）
 2. **Phase 2 重叠分析**：`Overlapped/Total < 5%` = 严重并行瓶颈；假性重叠检测
