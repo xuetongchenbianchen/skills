@@ -124,6 +124,47 @@ L0 + wall-clock 在性能测试集上跨 shape 采集作为兜底：每轮优化
 
 ---
 
+## 多卡切分前置判定（条件触发）
+
+第一节代码理解完成后，即可从模型规模与运行需求初判单卡 HBM 是否够用。**若单卡放不下，必须先完成多卡切分再采集 profiling——否则基线脚本根本跑不通**。大量"需要并行"的诉求源于配置不当，纠正后单卡即可运行——先在本节完成下方分诊，**只有确认"本质需要并行"后才去阅读 [07_parallel_splitting/SKILL.md](../07_parallel_splitting/SKILL.md)**。
+
+### 分诊决策树
+
+```
+单卡 HBM 不足（代码估算或运行 OOM）
+├─ Step 1: 外部因素排查 → 命中 → 修复，不触发并行
+├─ Step 2: 显存预算估算 → 理论峰值 < HBM × 0.8 → 仍有外部因素，回 Step 1
+└─ Step 3: 理论峰值 > HBM × 0.8（排除外部因素后）→ 本质需要并行
+```
+
+### 外部因素排查清单（按频率排序）
+
+| # | 检查项 | 命中表现 | 修复 |
+|---|--------|---------|------|
+| 1 | 注意力融合未开启 | attention score 矩阵实体化 | 启用融合注意力算子 |
+| 2 | 内存碎片 | `max_memory_allocated` 远大于 `memory_allocated` | 调整分配策略 + tcmalloc |
+| 3 | 序列/Batch 配置不当 | padding 浪费 / 迭代步数过多 | 调整配置 |
+| 4 | 全量张量未释放 | 通信缓冲区持续存活，抵消切分收益 | 及时 `del`，复用缓冲区 |
+| 5 | 混合精度未启用 | FP32 每张量翻倍 | 切 BF16 / 量化 |
+| 6 | 环境配置 | 设备数不匹配 / 框架版本不配套 | 修正环境变量 |
+
+### 显存预算估算
+
+1. 识别模型中的**主导张量**——随输入规模超线性增长的张量（如 attention score、KV cache）
+2. 沿 forward 路径估算各模块峰值显存（主导张量 + 常驻部分如参数、优化器状态）
+3. 判定：若估算峰值 > HBM × 0.8（排除外部因素后）→ 本质需要并行
+
+> 0.8 阈值留出碎片与临时开销余量，可根据实际框架行为调整。
+
+### 分诊结论
+
+- **外部因素** → 修复后单卡即可，继续第五节正常采集 profiling
+- **本质需要并行** → 进入 [07_parallel_splitting/SKILL.md](../07_parallel_splitting/SKILL.md) 全流程（分析 → 实施 → 验证）；切分验证通过后回归第五节，完成带 profiling 的并行推理脚本并采集并行基线，再进入 Phase 2
+
+> 简单数据并行（DP only，多独立样本）不属于模型并行，直接配置 `ASCEND_RT_VISIBLE_DEVICES` 多卡即可（设计见 [parallel_design.md](../03_optimization/references/parallel_design.md)），不触发本流程。
+
+---
+
 ## 五、Profiling 采集体系构建
 
 完整代码模板和框架适配方案见 [profiling_collection.md](references/profiling_collection.md)。

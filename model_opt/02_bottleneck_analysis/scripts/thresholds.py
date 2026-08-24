@@ -146,4 +146,57 @@ THRESHOLDS = {
         "host_precompute_ratio": 0.2,       # ratio — tiling+workspace / total above this = signal
         "dominant_category_pct": 20,        # % — dominant API category above this = signal
     },
+
+    "multi_rank": {
+        # --- Phase 1: straggler detection ---
+        # (T_max - T_avg) / T_avg above this = straggler (Tail Card)
+        "tail_card_ratio": 0.10,           # 10% — above this = DEFINITE straggler
+        "tail_card_ratio_strong": 0.15,    # 15% — above this = severe straggler
+        # straggler detection — how much slower than median makes a rank a straggler
+        "straggler_ratio": 1.10,            # x — total time > median * this = DEFINITE straggler
+        "straggler_margin_ms": 2000,        # ms — minimum absolute margin to flag straggler (avoid noise)
+        # load imbalance — coefficient of variation (std/mean) across ranks
+        "comm_cv_signal": 0.30,            # comm time CV above this = SIGNAL imbalance
+        "comm_cv_definite": 0.50,          # comm time CV above this = DEFINITE imbalance
+        "compute_cv_signal": 0.05,         # computing time CV above this = SIGNAL (compute should be uniform)
+
+        # --- Phase 2: overlap & parallel efficiency ---
+        # Overlapped / Total below this = parallel bottleneck (comm not overlapped with compute)
+        "overlap_low_pct": 10,             # % — below this = SIGNAL parallel bottleneck
+        "overlap_severe_pct": 5,           # % — below this = DEFINITE severe parallel bottleneck
+        # false overlap: if overlap > 0 but comm_not_ovl still high, overlap may be ineffective
+        "false_overlap_comm_pct": 20,      # % — comm_not_ovl / total above this with overlap = false overlap hint
+
+        # --- Phase 3.4: communication deep analysis ---
+        # R_wait = 1 - (T_avg / T_max) per comm type — sync straggler metric
+        "r_wait_definite": 0.30,           # R_wait above this = DEFINITE sync straggler
+        # comm wait imbalance — which rank is the victim (waits the most)
+        "wait_imbalance_ratio": 2.0,       # max_rank_wait / min_rank_wait above this = DEFINITE
+        # small packet: single comm transfer below this = small packet overhead
+        "small_packet_mb": 32,            # MB — transfers below this = small packet (Hermes guide)
+        "small_packet_ratio": 0.30,        # % — small packet ratio above this = SIGNAL
+        # byte alignment: HCCS requires 512-byte aligned transfer sizes
+        "alignment_bytes": 512,           # bytes — HCCS alignment requirement
+        # RDMA retransmission: transit time above this = potential retransmission
+        "rdma_retransmission_ms": 4000,  # ms — transit time above this = SIGNAL (network issue)
+        # HBM contention: if overlapped comm co-occurs with compute, check for slowdown
+
+        # --- Phase 3.3: compute analysis ---
+        # per-op cross-rank variance
+        "op_cv_signal": 0.20,             # op total time CV above this = SIGNAL (imbalanced op)
+        "op_cv_min_share": 0.01,           # min share of total op time to consider for variance signal
+        # TransData / format conversion ops — these indicate private format conversion overhead
+        "transdata_keywords": ["TransData", "TransForm", "FormatTransfer"],
+
+        # --- Phase 5: MoE / AlltoAll load imbalance ---
+        # AlltoAll token distribution CV above this = load imbalance
+        "alltoall_cv_signal": 0.20,       # CV above this = SIGNAL load imbalance
+
+        # --- Phase 1: step spike detection ---
+        # step time > previous step * this ratio = sudden spike
+        "step_spike_ratio": 2.0,          # x — step time > prev * this = SIGNAL spike
+
+        # --- bandwidth across ranks ---
+        "link_bw_cv_signal": 0.30,        # per-link bandwidth CV across ranks above this = SIGNAL
+    },
 }

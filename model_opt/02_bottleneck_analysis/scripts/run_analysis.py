@@ -21,6 +21,7 @@
     F. 内存 (memory_record, operator_memory)
     G. CANN 运行时 (api_statistic)
     H. 通信 (communication, 仅多卡时存在)
+    I. 跨 Rank 对比 (multi_rank, 仅当 profiling 目录含多个 rank_N 时)
 
 默认行为: 报告自动保存到 L1 profiling 目录下的 analysis_report.txt。
 """
@@ -44,6 +45,7 @@ import parse_memory_record
 import parse_operator_memory
 import parse_api_statistic
 import parse_communication
+import parse_multi_rank
 
 
 DIVIDER = "=" * 70
@@ -267,6 +269,15 @@ def main():
         sec_h = run_section("H. 通信（多卡）", parse_communication.parse, comm_path, matrix_path, 15)
         all_signals.extend(_extract_signals(sec_h, "H"))
         detail_sections.append(sec_h)
+
+    # I. 跨 Rank 对比（仅当 profiling 目录含多个 rank_N 子目录时）
+    multi_rank_ranks = parse_multi_rank._discover_ranks(l1_dir)
+    if len(multi_rank_ranks) >= 2:
+        sec_i = run_section("I. 跨 Rank 对比（多卡）",
+                             parse_multi_rank.parse, l1_dir, 15,
+                             include_signals=False)
+        all_signals.extend(_extract_signals(sec_i, "I"))
+        detail_sections.append(sec_i)
 
     # --- 组装报告 ---
     report_parts = []

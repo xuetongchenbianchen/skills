@@ -38,13 +38,13 @@ Profiling 采集、精度对比等操作必须遵循统一规范，确保一致�
 ```
 Phase 1  前期准备
          ├─ 项目 git 初始化 + .gitignore（权重/profiling 等大文件）
+         ├─ 多卡切分前置判定（条件触发 → 07_parallel_splitting，先切分再采基线）
          └─ 采集 L0 基线 + wall-clock benchmark（全程仅一次，作为收益判定基准）
    ↓
 ┌─────────────────── 一个「优化阶段」（可迭代多轮）───────────────────┐
 │ Phase 2  瓶颈分析                                                  │
 │          ├─ Line B: Profiling 分析（采集 L1 → 脚本 → 定位可见瓶颈） │
-│          ├─ Line A: 源码分析（必做,四维度审视源码,发现结构性冗余）    │
-│          └─ Line C: OOM/容量分诊（条件触发 → 07_parallel_splitting） │
+│          └─ Line A: 源码分析（必做,四维度审视源码,发现结构性冗余）    │
 │    ↓                                                              │
 │  ★ A  用户确认优化方案（展示方案 → 确认/裁剪）                       │
 │    ↓                                                              │
@@ -89,25 +89,23 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 | Phase 4 | [04_accuracy_assurance/SKILL.md](04_accuracy_assurance/SKILL.md) | 验证精度、调试精度问题 |
 | Phase 5 | [05_engineering/SKILL.md](05_engineering/SKILL.md) | 代码管理、日志、版本控制 |
 | 案例库 | [06_evidence_db/schema.md](06_evidence_db/schema.md) | 优化案例的记录格式(schema 定义；案例数据存在项目工作目录 `evidence_db/` 下) |
-| 并行切分 | [07_parallel_splitting/SKILL.md](07_parallel_splitting/SKILL.md) | OOM/显存不足/需要多卡时触发（条件轨道，非顺序阶段） |
+| 并行切分 | [07_parallel_splitting/SKILL.md](07_parallel_splitting/SKILL.md) | Phase 1 分诊或用户报告显存不足/需要多卡时触发（条件轨道，非顺序阶段） |
 
 ## 多卡切分集成
 
 07_parallel_splitting 是**条件触发的专业轨道**，不是顺序 Phase。当瓶颈是显存容量（而非计算效率）时，从主流程分支进入，完成后回归主流程。
 
-**触发条件**：
-- Phase 2 的 `parse_operator_memory.py` Parallelism Trigger 报告"消除 waste 后投影峰值仍 > 80% HBM"
-- 用户直接报告 OOM / 显存不足 / 需要多卡
+**触发位置**：Phase 1 前期准备阶段。完成模型代码理解后，按 [01_preparation/SKILL.md](01_preparation/SKILL.md)「多卡切分前置判定」做 OOM 根因分诊；用户直接报告显存不足/需要多卡同样触发。
 
 **Handoff 协议**：
-1. Phase 2 Line C 按 `07_parallel_splitting/references/analysis_workflow.md`（Phase 0 节）执行 OOM 根因分诊（外部因素排查 → 理论显存估算 → 判定）
+1. Phase 1 按 [01_preparation/SKILL.md](01_preparation/SKILL.md)「多卡切分前置判定」执行 OOM 根因分诊（外部因素排查 → 显存预算估算 → 判定）
 2. 分诊确认"外部因素" → 修复后继续 model_opt 正常流程（不进入并行切分）
-3. 分诊确认"本质需要并行" → 进入 `07_parallel_splitting/SKILL.md` 全流程（分析 → 实施 → 验证）
-4. 并行切分验证通过后 → 回归 Phase 4 标准门禁 → Phase 5 工程化提交（含 ADR 归档）
+3. 分诊确认"本质需要并行" → 进入 `07_parallel_splitting/SKILL.md` 全流程（分析 → 实施 → 验证，步骤 0-7）
+4. 切分验证通过后 → 回归 Phase 1 主线，完成带 profiling 的并行推理脚本并采集并行基线（L0/wall-clock）→ 进入 Phase 2 瓶颈分析 → Phase 3 四维度优化 → Phase 4 门禁 → Phase 5 工程化提交（evidence_db 纳入）
 
 ## 各阶段要点
 
-**Phase 1 前期准备**：理解模型代码、搭建 NPU 环境、准备测试数据、构建 profiling 采集脚本和精度验证脚本。关键产出：可复现的**基线性能数据（L0 + wall-clock，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
+**Phase 1 前期准备**：理解模型代码、搭建 NPU 环境、准备测试数据、构建 profiling 采集脚本和精度验证脚本。代码理解后做多卡切分前置判定——单卡放不下则先进入 [07_parallel_splitting](07_parallel_splitting/SKILL.md) 切分，再采集基线。关键产出：可复现的**基线性能数据（L0 + wall-clock，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
 
 **Phase 2 瓶颈分析**：
 - **新轮次强制重置**：每轮 Phase 2 必须从零开始——重新采集 L1、重新运行分析脚本、重新估算下界。上一轮的分析结论/未实施方案/优化方向全部失效（性能 profile 已变）。

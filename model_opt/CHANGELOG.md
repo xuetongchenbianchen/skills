@@ -4,7 +4,7 @@
 
 本次更新为 `model_opt` 技能新增了 **多卡推理并行切分子技能 `07_parallel_splitting`**，将原本仅覆盖单卡性能优化的四维度流程，扩展到显存容量受限场景下的多卡切分能力。`07_parallel_splitting` 是 model_opt 的**条件触发专业轨道**（非顺序 Phase），当瓶颈是显存容量而非计算效率时，从主流程 Phase 2 的 Line C 分支进入，完成后回归 Phase 4 门禁与 Phase 5 工程化提交。
 
-同时伴随少量 references 调整：新增 `03_optimization/references/comm_optimization.md`、`decode_optimization.md`，并将 `equivalence_verification.md` 归入 `04_accuracy_assurance/references/`。
+同时伴随少量 references 调整：新增 `decode_optimization.md`，并将 `equivalence_verification.md` 归入 `04_accuracy_assurance/references/`。通信瓶颈诊断已并入 `02_bottleneck_analysis/references/profiling_to_action.md` 归因层 #8。
 
 本说明围绕 `07_parallel_splitting` 的新特性展开。
 
@@ -19,17 +19,17 @@
   1. Phase 2 Line C 自动触发 — profiling 的 `parse_operator_memory.py` 报告「消除 waste 后投影峰值仍 > 80% HBM」，经 OOM 分诊确认为「本质需要并行」后进入全流程。
   2. 用户直接触发 — 报告显存不足 / 需要多卡 / 要求模型并行时直接进入。
 - **简单并行 vs 全流程**：仅需 DP（数据并行）等简单策略时不进入本子技能，用 `03_optimization/references/parallel_design.md` 快速参考即可；需要 SP/TP/PP/EP 等复杂切分时升级到全流程。
-- **Handhand 协议**：Phase 2 Line C 分诊 → 确认本质需要并行 → 分析+实施替代 Phase 3 → 验证回归 Phase 4 门禁 → Phase 5 工程化提交（含 ADR 归档）。回退路径：`disable_parallel()` 回到单卡，回到四维度优化。
+- **Handoff 协议**：Phase 2 Line C 分诊 → 确认本质需要并行 → 分析+实施+验证（支线，不替代 Phase 3） → 第八步：profiling 脚本并行化适配 → 回归主流程 Phase 3 → Phase 4 门禁 → Phase 5 工程化提交（evidence_db 纳入）。回退路径：`disable_parallel()` 回到单卡，回到四维度优化。
 
 ### 核心原则
 
 - **先分诊再切分**：外部因素（配置不当、NPU 资源管理不善等）先修复，不切分；本质需要并行才触发切分流程。
 - **禁止修改模型架构**：切分只改变计算的分布方式，不改变模型的数学语义和结构。
-- **三角度论证**：切分方案必须从数学正确性、完备性、系统可行性三个角度论证，并输出 JSON 分析文件。
+- **三角度论证**：切分方案必须从数学正确性、完备性、系统可行性三个角度论证，分析结果记录到 evidence_db（`parallel_splitting` 字段）。
 
 ---
 
-## 全流程（7 步 + 归档）
+## 全流程（8 步）
 
 ```
 Phase 0  OOM 根因分诊 → 外部因素修复★终止 / 本质需要 → 进入分析
@@ -38,7 +38,7 @@ Phase 0  OOM 根因分诊 → 外部因素修复★终止 / 本质需要 → 进
    第一步  提取模型参数与模块链路
    第二步  模块级拆解 → 内存变化分析 → 定性分类 → 候选并行模式
    第三步  定量估算
-   第四步  方案审查 → 输出 JSON（数学/完备性/系统）  ★ 确认
+   第四步  记录分析到 evidence_db  ★ 确认
    （可选）第五步  Profiling 数据校准
    ↓
 实施阶段
@@ -47,7 +47,8 @@ Phase 0  OOM 根因分诊 → 外部因素修复★终止 / 本质需要 → 进
 验证阶段
    第七步  正确性验证：端到端测试，切分前后输出一致性   ★ 确认提交
    ↓
-归档（ADR）
+回归前置
+   第八步  Phase 1 profiling 脚本并行化适配
 ```
 
 含完整错误回退路径：每个确认/验证节点失败均有明确的回退目标（回第三步 / 回第四步 / 回分诊）。
@@ -63,25 +64,21 @@ Phase 0  OOM 根因分诊 → 外部因素修复★终止 / 本质需要 → 进
 - **外部因素排查清单**（6 项，按频率排序）：注意力融合未开启、内存碎片、序列/Batch 配置不当、全量张量未释放、混合精度未启用、环境配置。
 - **显存预算估算**：识别随输入规模超线性增长的「主导张量」，沿 forward 路径估算各模块峰值，以 `HBM × 0.8` 为阈值判定是否本质需要并行。
 
-### 2. 四步分析方法 + JSON 输出规范
+### 2. 四步分析方法
 
-- **第一步**：提取模型参数与模块链路，识别主导张量的复杂度类型（O(N²) attention/pair、O(N³) 高阶交互、O(gridᵈ) 空间场、O(E×d) 边特征等）。
-- **第二步**：构建内存时间线（逐模块追踪张量生命周期 + 递归检查子模块）→ 定性分类（elementwise / memory_bound / compute_bound 等 5 类）→ 建立**张量分布约定表**（逐张量声明分布方式，未声明视为潜在 bug）。
-- **第三步**：定量估算单卡峰值、切分后每卡显存、SP 通信量、通信耗时、PP 气泡率，并给出通信开销速查表。
-- **第四步**：方案审查并输出 JSON，从三角度论证。JSON 审查标准为 **4 公理 + 2 不变量**：
-  - 公理：必要性、可切分性、完备性、正确性
-  - 不变量：显存缩放（切后每卡 < HBM×0.8）、通信下界（ratio < 1.0 必有隐藏错误）
-- **（可选）第五步**：估算不确定时，单卡实测各模块耗时 + 通信 benchmark 实测带宽，校准 JSON。
+- **第一步**：提取模型参数与模块链路，识别主导张量的增长阶（超线性 O(N²)+ / 线性 O(N×d)）。
+- **第二步**：构建内存时间线（逐模块追踪张量生命周期 + 递归检查子模块）→ 定性分类（三问决策：切什么 → 沿哪切 → 能否叠加 DP）→ 建立**张量分布约定表**（逐张量声明分布方式，未声明视为潜在 bug）。
+- **第三步**：定量估算单卡峰值、切分后每卡峰值、通信量（按切分维度区分）、通信耗时、break-even。
+- **第四步**：记录分析到 evidence_db（`parallel_splitting` 字段），agent 自查关键检查项（显存阈值、通信下界、张量覆盖、pitfall mitigation）后 → ★ 确认节点。
+- **（可选）第五步**：估算不确定时，单卡实测各模块耗时 + 通信 benchmark 实测带宽，校准 evidence_db 记录。
 
-### 3. 三种并行策略分析框架
+### 3. 切分维度分析框架
 
-提供 SP / PP / EP / DP 的系统化分析方法与决策依据：
+按**（切分位置, 切分维度）**组织分析，不预设策略名词：
 
-- **SP（序列并行）**：将超线性主导张量沿高阶维度切分到多卡，AllToAll 转换视角，本地计算后聚合。给出**通用数学模式**——对共享索引 k 的 `Y[i,j] = Σ_k a[i,k]·b[j,k]`，各类超线性操作均可归结为此模式的实例。
-- **PP（流水线并行）**：气泡分析 `bubble = (P-1)/(P+micro_batches-1)`；推理 micro_batch=1 时气泡率极高，通常不推荐。
-- **EP（专家并行）**：MoE 专家分布 + gate 路由 + AllToAll 分发，需评估 capacity_factor 与负载均衡。
-- **策略组合层级**：按通信代价分层 `DP(外) → EP/PP(中) → SP/TP(内)`。
-- **PP vs SP 决策**：推理场景（micro_batch=1）下 SP 几乎总优于 PP。
+- **输入处切分**（横切/竖切）：横切 batch 维 = DP；竖切 seq/空间维 = SP，需 AllToAll 交换分片。给出**通用数学模式**——对共享索引 k 的 `Y[i,j] = Σ_k a[i,k]·b[j,k]`，各类超线性操作均可归结为此模式的实例。
+- **中间模块切分**：模块内切权重 = TP，AllReduce 合并；模块间切层 = PP，气泡率 `(P-1)/(P+micro_batches-1)`，推理场景通常不推荐。
+- **特殊结构切分**：MoE 专家维 = EP，AllToAll 分发 + 负载均衡。其他特殊结构按结构特点分析。
 
 ### 4. 实施四模式 + 通信原语模板库
 
@@ -123,27 +120,16 @@ Phase 0  OOM 根因分诊 → 外部因素修复★终止 / 本质需要 → 进
 
 `self_test()` 在搭建通信 infra 后第一步必跑（`torchrun --nproc_per_node=N`），验证 6 项原语（allgather / scatter+allgather 往返 / row_to_col+col_to_row 往返 / allreduce / broadcast / gather_to_rank0），快速排查高频坑（未 import torch_npu、contiguous 等）。
 
-### 9. 18 条常见坑 + 通用排查流程
+### 9. 调试排查
 
-按频率排序的 18 条常见坑，覆盖：
+问题按类型分类归属：环境/部署问题归 Phase 1，性能问题归 Phase 3，切分方法问题在本阶段处理。保留排查流程（self_test → 冒烟 → py-spy dump → 打印 shape → tolerance 对比）和 3 条切分方法常见问题（通信死锁、shape 不匹配、并行开关误触发）。
 
-- 基础（#1-10）：集合通信死锁、Shape 不匹配、AllToAll contiguous、非确定性结果、HCCL 初始化失败、并行比单卡慢、切分后仍 OOM、并行开关误触发、跨迭代 shape 变化、负索引维度歧义。
-- 多节点专项（#11-13）：连接超时、拓扑发现失败、参数不一致。
-- 回滚与清理专项（#14-16）：Patch 残留、分布式状态残留、通信缓冲区泄漏。
-- 混合并行专项（#17-18）：ProcessGroup dp_ranks offset 错误、ReduceScatter dim≠0 需 permute。
+### 10. 两个用户确认节点
 
-配套通用排查流程（self_test → 冒烟 → py-spy dump → 打印 shape → 单卡 vs 多卡 → profiling 看通信占比）。
+- **★ 方案确认**（第四步后）：展示切分方案 + 定量估算 + 等价性证明 + 风险应对，用 `ask_user_question` 确认实施。
+- **★ 提交审核**（第七步后）：展示验证结果 + 性能收益，用 `ask_user_question` 确认提交。
 
-### 10. ADR 决策归档模板
-
-提供标准化 ADR 模板，记录场景约束、Phase 0 分诊、内存时间线、定量估算、JSON 审查、实施摘要、验证结果、回退方案、未采纳方案及原因，纳入 Phase 5 工程化提交。
-
-### 11. 两个用户确认节点
-
-- **★ JSON 审查**（第四步后）：展示数学正确性 + 完备性 + 系统可行性 + 策略对比 + 推荐配置 + 风险应对，用 `ask_user_question` 确认实施。
-- **★ 提交审核**（第七步后）：展示验证结果 + 性能收益 + ADR 路径，用 `ask_user_question` 确认提交。
-
-### 12. 非 2 的幂卡数处理
+### 11. 非 2 的幂卡数处理
 
 优先将 2 的幂部分分配给 TP（HCCL 优化好），剩余分配给 SP；序列不整除时 padding 到可整除，计算后裁剪。
 
@@ -154,12 +140,12 @@ Phase 0  OOM 根因分诊 → 外部因素修复★终止 / 本质需要 → 进
 | 产物 | 阶段 | 路径 | 用途 |
 |------|------|------|------|
 | OOM 分诊结论 | Phase 0 | stdout | 判定是否需要并行 |
-| 内存时间线表 | 第二步 | stdout / JSON | 逐模块峰值定位瓶颈 |
-| 分析 JSON | 第四步 | `parallel_decisions/analysis_{model}_{seq_len}_{world_size}p.json` | 切分方案论证 |
-| 通信原语模块 | 第六步 | `comm/comm_primitives.py` | 通信 infra |
-| 并行推理脚本 | 第六步 | `run_parallel.py` | 多卡推理入口 |
+| 内存时间线表 | 第二步 | stdout / evidence_db | 逐模块峰值定位瓶颈 |
+| 分析记录 | 第四步 | `evidence_db/<id>.yaml`（`parallel_splitting` 字段） | 切分方案论证 |
+| 通信原语模块 | 第六步 | `comm/comm_primitives.py`（按模板实现） | 通信 infra |
+| 并行推理脚本 | 第六步 | `run_parallel.py` | 多卡推理入口（验证用） |
+| 并行 profiling 脚本 | 第八步 | Phase 1 脚本的并行版本（同路径覆写或 `_parallel` 后缀） | 回归主线后 Phase 3/4 采集 L0/L1/wall-clock |
 | 验证报告 | 第七步 | `verify_report.json` | 正确性验证结果 |
-| ADR 决策记录 | 归档 | `parallel_decisions/ADR-NNNN-*.md` | 决策归档 |
 
 ---
 
@@ -168,9 +154,8 @@ Phase 0  OOM 根因分诊 → 外部因素修复★终止 / 本质需要 → 进
 本次更新在 `model_opt` 下新增/调整的文件：
 
 - 新增 `07_parallel_splitting/SKILL.md` — 子技能入口与流程概览
-- 新增 `07_parallel_splitting/references/analysis_workflow.md` — Phase 0 分诊 + 分析 Step 1-5 + JSON 规范
-- 新增 `07_parallel_splitting/references/implementation_guide.md` — 4 种实施模式 + 通信原语模板 + NPU 差异 + 验证模板 + ADR + 18 条坑
-- 新增 `03_optimization/references/comm_optimization.md` — 通信性能优化（并行 infra 搭建后通信成瓶颈时参考）
+- 新增 `07_parallel_splitting/references/analysis_workflow.md` — Phase 0 分诊 + 分析 Step 1-5 + 切分维度分析
+- 新增 `07_parallel_splitting/references/implementation_guide.md` — 4 种实施模式 + 通信原语引用 + NPU 差异 + 验证方法 + 调试排查
 - 新增 `03_optimization/references/decode_optimization.md` — decode 阶段优化参考
 - 调整 `equivalence_verification.md` — 从 `03_optimization/references/` 归入 `04_accuracy_assurance/references/`
 - 更新 `SKILL.md`（根）— 新增「多卡切分集成」章节与 07 子技能索引、Phase 2 Line C 触发说明

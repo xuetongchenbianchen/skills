@@ -21,6 +21,7 @@
 | `parse_operator_memory.py` | `operator_memory.csv` | ~10K 行 | 内存分配热点 |
 | `parse_communication.py` | `communication.json` + `communication_matrix.json` | — | 多卡通信分析：时间分解、带宽、等待占比 |
 | `parse_trace_view.py` | `trace_view.json` | 4MB-1GB+ | 时序：host→device 下发链、device 空隙、在线编译停顿、Call stack 源码栈 |
+| `parse_multi_rank.py` | 跨所有 rank 的 `step_trace` + `communication` + `op_statistic` + `communication_matrix` + `kernel_details` | — | 多卡五阶段分层分析：Phase 1 慢卡定位+通信域推断、Phase 2 重叠分析、Phase 3 R_wait+小包/对齐、Phase 5 AlltoAll/MoE 负载不均衡 |
 | `diff_profiling.py` | 两份 profiling 目录 | — | 对比两次采集的算子耗时和内存变化 |
 
 ## 通用调用方式
@@ -334,6 +335,68 @@ python parse_communication.py /path/to/profiling --rank 0 --top-k 15
 
 ---
 
+### parse_multi_rank.py
+
+**输入**：多卡 profiling 目录（包含 `rank_0/` ~ `rank_N/` 子目录），跨所有 rank 的 `step_trace_time.csv`、`communication.json`、`op_statistic.csv`、`communication_matrix.json`、`kernel_details.csv`
+
+**定位**：多卡场景的核心分析工具，基于五阶段分层分析方法论（详见 [multi_rank_analysis_guide.md](multi_rank_analysis_guide.md)）。`parse_communication.py` 分析单 rank 的通信，本脚本跨所有 rank 对比，从"全局粗筛"到"微观根因"分层定位瓶颈。
+
+**输出包含（按 Phase 顺序）**：
+
+**Phase 1: 全局扫描与慢卡定位**
+1. **跨 Rank Step Trace 对比**：所有 rank 的 Total/Computing/Free/Comm(Not Overlapped)/Util 并列表，附带 min/avg/median/max/CV 统计。
+   - **Tail Card 检测**：`(T_max - T_avg) / T_avg > 10%` = DEFINITE 慢卡；`> 15%` = 严重慢卡。木桶效应——整体吞吐被最慢卡拖累。
+   - 逐 Step 慢卡定位（多 step 场景）：找出 Step Time 飙升的具体 step 和 rank。
+   - [DEFINITE] 通信时间跨 rank 严重不均衡（CV > 0.50）；[SIGNAL] Computing 不均衡（CV > 0.05）
+
+2. **通信域推断与并行策略识别**：基于通信算子类型自动推断并行策略。
+   - allReduce → DP（数据并行）；allGather/reducescatter → TP/FSDP；alltoall → EP/MoE；send/recv → PP
+   - 通信域分组指导：DP 域内可直接对比，TP/PP 域不可跨域混比
+
+**Phase 2: 时间线分解与并行效率**
+3. **计算-通信重叠分析**：所有 rank 的 Overlapped/Total/Comm(Not Overlapped) 并列表。
+   - [DEFINITE] 严重并行瓶颈（重叠率 < 5%）— 通信暴露在关键路径，优先调并行策略
+   - [SIGNAL] 疑似假性重叠（重叠 > 5% 但未重叠通信仍 > 20%）— 通信 DMA 与计算争抢 HBM 带宽
+
+**Phase 3: 深度根因定位**
+4. **跨 Rank 通信深度分析**：所有 rank 的 Elapse/Transit/Wait 拆解 + R_wait 分析。
+   - [DEFINITE] Wait 不均衡（max/min > 2.0x）— straggler 受害者（等待最久）vs straggler（等待最少）
+   - [DEFINITE] Transit 极低（<5%）— 通信全是等待，synchronization-bound
+   - **R_wait = 1 - (T_avg / T_max)** 按算子类型分别计算，R_wait > 30% = DEFINITE 同步慢卡；> 50% = 通信瓶颈本质是同步等待
+   - 按通信算子类型跨 rank 对比表（Elapse/Count/Wait + CV）
+
+5. **跨 Rank 算子耗时对比**（Phase 3.3）：Top 算子按总耗时排序跨 rank 并列。
+   - [SIGNAL] 高方差算子（CV > 0.20 且 share > 1%）— 通常通信相关算子（如 allgatherAicpuKernel）
+
+6. **跨 Rank 逐 Link 带宽 + 小包/对齐**（Phase 3.4）：按 transport 类型分组对比带宽。
+   - [SIGNAL] 某 transport 带宽跨 rank 方差大（CV > 0.30）
+   - **小包分析**：检测 < 32MB 的传输占比（来自 communication.json Size Distribution）
+   - **字节对齐检查**：非 512B 对齐的 link（HCCS 硬性要求，带宽可能腰斩）
+
+**Phase 5: MoE / AlltoAll 专项**
+7. **AlltoAll 负载不均衡检测**：从 kernel_details.csv 提取 alltoall kernel 跨 rank 对比。
+   - [DEFINITE] AlltoAll 总耗时跨 rank CV > 0.2 = 负载不均（Expert Imbalance）
+   - AlltoAll Input Shapes 跨 rank 对比（定位 Token 分布差异）
+   - 优化方向：MoE 路由算法 / 专家容量因子
+
+8. **信号汇总**：[DEFINITE]/[SIGNAL]/[FUTURE] 分组（仅独立运行时；`run_analysis.py` 集成时由总章统一汇总）
+
+**何时使用**：
+- 多卡 profiling 采集后，快速定位 straggler rank 和负载不均衡
+- 通信占比高时，确认是同步瓶颈（R_wait）还是带宽瓶颈（Transit）
+- MoE 场景排查 AlltoAll 负载不均衡（Token 分布）
+- `run_analysis.py` 在检测到多个 rank 目录时自动包含本节（Section I）
+
+```bash
+# 独立运行（含信号汇总）
+python parse_multi_rank.py /path/to/profiling --top-k 15
+
+# 通过 run_analysis.py 自动集成（rank 目录被自动检测）
+python run_analysis.py /path/to/profiling --rank 0
+```
+
+---
+
 ### diff_profiling.py
 
 **输入**：两个 profiling 目录（before / after）
@@ -359,7 +422,7 @@ python diff_profiling.py /path/to/before /path/to/after --top-k 20
 
 ## 注意事项
 
-- `run_analysis.py` 生成两段式报告：**总章**（全局优化空间 + 信号清单，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组，首读只需看此章）+ **细节章**（A~H 节完整 statistics，供下钻参考）。信号标记说明在总章声明一次
+- `run_analysis.py` 生成两段式报告：**总章**（全局优化空间 + 信号清单，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组，首读只需看此章）+ **细节章**（A~I 节完整 statistics，供下钻参考；I 节仅多卡场景出现）。信号标记说明在总章声明一次
 - 所有脚本都输出 signal 行（`[DEFINITE]`/`[SIGNAL]`/`[FUTURE]`），由 `run_analysis.py` 提取汇总到总章——列出有疑点的数据，不做最终判定，由 agent 决定是否深入
 - 脚本只负责**数据提取和压缩**，不做优化决策——决策由 agent 结合源码分析完成
 - Call Stack 不做任何过滤，保证信息完整性

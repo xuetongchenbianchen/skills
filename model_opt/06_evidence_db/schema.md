@@ -54,6 +54,35 @@
         dimension: <string, optional>
           # eliminate_redundancy / reuse_and_precompute / hide_latency / equivalent_substitution
         implementation_detail: <string>  # 具体代码层面怎么改的(文件、函数、改法)
+        parallel_splitting: <object, optional>
+          # 并行切分专用字段。仅当本案例涉及多卡切分时填写。
+          split_position: <string>  # input / module / special
+          split_dimension: <string>  # horizontal / vertical
+          implementation_mode: <string>  # A(外部编排) / B(Monkey-Patch) / C(子类覆写) / D(源码内嵌)
+          tensor_distribution_table:
+            - tensor: <string>
+              global_shape: <list[int]>
+              distribution: <string>
+              per_card_shape: <list[int]>
+              consumer_op: <string>
+              recovery_comm: <string>
+          quantitative:
+            single_card_peak_bytes: <int>
+            per_card_peak_after_split_bytes: <int>
+            hbm_bytes: <int>
+            communication_volume_bytes: <int>
+            communication_time_ms: <float>
+            break_even: <string>  # 通信耗时 vs 计算节省的对比结论
+          proofs:
+            - operation: <string>
+              equivalence_proof: <string>  # 切分等价性论证
+              lower_bound_comm_bytes: <int>  # 理论通信下界
+              actual_comm_bytes: <int>  # 实际通信量
+              ratio: <float>  # actual / lower_bound，< 1.0 说明估算有误
+          known_pitfalls:
+            - pitfall: <string>
+              mitigation: <string>
+          rollback: <string>  # disable_parallel() / cleanup_all_patches() / git revert
         equivalence_verification:
           method: <string>  # 怎么验证等价性的
           metrics: <list, optional>
@@ -86,6 +115,10 @@
     # 如: "NPU async pipeline (TASK_QUEUE_ENABLE=2) makes host-side optimizations counterproductive"
     # 如: "data_ptr() cache is unsafe on NPU due to memory address reuse"
     # 如: "torch.einsum internal decomposition is worse than opt_einsum_fx on NPU"
+    # 如: "NPU AllToAll requires .contiguous() after chunk() (GPU usually doesn't)"
+    # 如: "HCCL backend requires importing torch_npu before torch.npu.is_available() check"
+    # 如: "NPU operators may be non-deterministic; per-sample seeding (torch/random/np.random) needed"
+    # 如: "Multi-node NPU needs HCCL_CONNECT_TIMEOUT=600 to avoid connection timeout"
 
   context:
     hardware: <string>   # 如 "Ascend 910B"
