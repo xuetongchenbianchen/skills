@@ -32,7 +32,6 @@ wall-clock ≈ L0 Computing + L0 Free
 - **L0 Free**（device 空闲时间）：优化空间的主要来源。可通过减少 dispatch 次数（去重/融合）、编译工具消除。
 - **L0 Computing**（kernel 执行时间）：不完全不可压缩。去重消除冗余 kernel直接减少 Computing；融合算子减少中间结果读写可能降低总执行时间；等价替换改变 kernel 组成可能增减 Computing。但每个 kernel 的实际计算量（FLOPs）决定的最小执行时间不可压缩——除非换算法或量化。
 
-Roofline 降级为可选参考量：对大 tensor 场景可作为 kernel 执行时间的理论下界参考；对小 tensor 场景不适用（瓶颈是 dispatch overhead 而非计算）。
 
 ## 不可压缩下界的估计
 

@@ -1,6 +1,6 @@
 ---
 name: npu-model-optimization
-description: 模型性能优化全流程（profiling 驱动的瓶颈分析 → 四维度优化 → 精度验证 → 工程化提交）。当用户想优化模型性能、推理/训练速度、分析 profiling 数据、定位性能瓶颈、或在昇腾 NPU 上做模型适配与调优时触发。
+description: NPU 模型适配与性能优化全流程（模型适配 → profiling 驱动的瓶颈分析 → 四维度优化 → 精度验证 → 工程化提交）。当用户需要把模型跑通/适配到 NPU、优化模型性能或推理/训练速度、分析 profiling 数据、定位性能瓶颈、做显存不足的多卡切分时触发。
 ---
 
 # NPU 模型适配优化
@@ -8,6 +8,7 @@ description: 模型性能优化全流程（profiling 驱动的瓶颈分析 → �
 ## 启动协议
 
 无论从哪个子技能进入，执行前必须：
+0. 适配状态判定：找到既有推理脚本现场跑一遍——跑通则跳过 Phase 0 直接进入 Phase 1；跑不通或无脚本则进入 Phase 0（[00_adaptation](00_adaptation/SKILL.md)）
 1. 确认当前在哪个 Phase（参见下方「全流程」）
 2. 确认上一个 Phase 的产出已完成
 3. 按全流程顺序执行，不跳步
@@ -25,20 +26,19 @@ description: 模型性能优化全流程（profiling 驱动的瓶颈分析 → �
 
 ## 标准化操作规范
 
-Profiling 采集、精度对比等操作必须遵循统一规范，确保一致性和可复现。详见 [references/standardized_operations.md](references/standardized_operations.md)。
-
-## 优化四维度
-
-所有具体的性能优化手段，本质上只做四件事：**去重**（消除重复/无效的工作）、**复用**（对已有资源重复利用而非重新创建）、**掩盖**（用并行让延迟不可见）、**替换**（用硬件更友好的等价实现）。详见 [03_optimization/SKILL.md](03_optimization/SKILL.md)。
+Profiling 采集、精度对比、标准项目目录结构等统一规范，确保一致性和可复现。详见 [references/standardized_operations.md](references/standardized_operations.md)。
 
 ## 全流程
 
 > **术语：一个「优化阶段」= Phase 2 → Phase 4 的一轮迭代**（profiling 分析 + 优化实施 + 精度/收益确认）。下方 Phase 2–4 构成一轮，Phase 5 提交后若瓶颈转移则回到 Phase 2 开启下一轮。
 
 ```
-Phase 1  前期准备
-         ├─ 项目 git 初始化 + .gitignore（权重/profiling 等大文件）
-         ├─ 多卡切分前置判定（条件触发 → 07_parallel_splitting，先切分再采基线）
+Phase 0  模型适配（00_adaptation；已适配模型经启动协议第 0 步跳过）
+         ├─ 环境准备与项目初始化 → 权重获取 → 推理实现 → 冒烟测试
+         ├─ 冒烟 OOM → 自动分诊（详见 00）→ 本质需要并行则进入 07 切分后回归
+         └─ 与迁移前 golden（GPU/CPU 原始实现）精度对齐 → 适配完成
+   ↓
+Phase 1  基线准备
          └─ 采集 L0 基线 + wall-clock benchmark（全程仅一次，作为收益判定基准）
    ↓
 ┌─────────────────── 一个「优化阶段」（可迭代多轮）───────────────────┐
@@ -83,58 +83,39 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 | 阶段 | 子技能 | 触发时机 |
 |------|--------|----------|
-| Phase 1 | [01_preparation/SKILL.md](01_preparation/SKILL.md) | 项目启动、环境搭建、基线采集、脚本构建 |
+| Phase 0 | [00_adaptation/SKILL.md](00_adaptation/SKILL.md) | 模型适配：环境/权重/推理实现/冒烟 OOM 分诊/golden 精度对齐 |
+| Phase 1 | [01_preparation/SKILL.md](01_preparation/SKILL.md) | 基线采集与脚本构建：测试数据、profiling 采集体系、精度回归脚本 |
 | Phase 2 | [02_bottleneck_analysis/SKILL.md](02_bottleneck_analysis/SKILL.md) | 瓶颈分析:源码结构线 + Profiling 数据线 |
 | Phase 3 | [03_optimization/SKILL.md](03_optimization/SKILL.md) | 实施具体优化手段 |
 | Phase 4 | [04_accuracy_assurance/SKILL.md](04_accuracy_assurance/SKILL.md) | 验证精度、调试精度问题 |
 | Phase 5 | [05_engineering/SKILL.md](05_engineering/SKILL.md) | 代码管理、日志、版本控制 |
 | 案例库 | [06_evidence_db/schema.md](06_evidence_db/schema.md) | 优化案例的记录格式(schema 定义；案例数据存在项目工作目录 `evidence_db/` 下) |
-| 并行切分 | [07_parallel_splitting/SKILL.md](07_parallel_splitting/SKILL.md) | Phase 1 分诊或用户报告显存不足/需要多卡时触发（条件轨道，非顺序阶段） |
-
-## 多卡切分集成
-
-07_parallel_splitting 是**条件触发的专业轨道**，不是顺序 Phase。当瓶颈是显存容量（而非计算效率）时，从主流程分支进入，完成后回归主流程。
-
-**触发位置**：Phase 1 前期准备阶段。完成模型代码理解后，按 [01_preparation/SKILL.md](01_preparation/SKILL.md)「多卡切分前置判定」做 OOM 根因分诊；用户直接报告显存不足/需要多卡同样触发。
-
-**Handoff 协议**：
-1. Phase 1 按 [01_preparation/SKILL.md](01_preparation/SKILL.md)「多卡切分前置判定」执行 OOM 根因分诊（外部因素排查 → 显存预算估算 → 判定）
-2. 分诊确认"外部因素" → 修复后继续 model_opt 正常流程（不进入并行切分）
-3. 分诊确认"本质需要并行" → 进入 `07_parallel_splitting/SKILL.md` 全流程（分析 → 实施 → 验证，步骤 0-7）
-4. 切分验证通过后 → 回归 Phase 1 主线，完成带 profiling 的并行推理脚本并采集并行基线（L0/wall-clock）→ 进入 Phase 2 瓶颈分析 → Phase 3 四维度优化 → Phase 4 门禁 → Phase 5 工程化提交（evidence_db 纳入）
+| 并行切分 | [07_parallel_splitting/SKILL.md](07_parallel_splitting/SKILL.md) | Phase 0 冒烟分诊或用户报告显存不足/需要多卡时触发（条件轨道，非顺序阶段；与主流程的 handoff 见 00 与 07 各自的流程位置说明） |
 
 ## 各阶段要点
 
-**Phase 1 前期准备**：理解模型代码、搭建 NPU 环境、准备测试数据、构建 profiling 采集脚本和精度验证脚本。代码理解后做多卡切分前置判定——单卡放不下则先进入 [07_parallel_splitting](07_parallel_splitting/SKILL.md) 切分，再采集基线。关键产出：可复现的**基线性能数据（L0 + wall-clock，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
+**Phase 0 模型适配**：让模型在 NPU 上正确跑通——环境隔离、权重获取、严格按原始文档的推理实现、冒烟 OOM 分诊（决定是否多卡切分）、与迁移前 golden 精度对齐。
+
+**Phase 1 基线准备**：准备测试数据、构建 profiling 采集脚本和精度回归脚本（对齐优化前 NPU 输出；迁移前 golden 对齐已在 Phase 0 完成）。关键产出：可复现的**基线性能数据（L0 + wall-clock，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
 
 **Phase 2 瓶颈分析**：
 - **新轮次强制重置**：每轮 Phase 2 必须从零开始——重新采集 L1、重新运行分析脚本、重新估算下界。上一轮的分析结论/未实施方案/优化方向全部失效（性能 profile 已变）。
 - **下界分析（先做）**：估算优化空间——读取 L0 Computing 和 L0 Free，判断是否还有空间、还有多少。详见 [bound_analysis.md](references/bound_analysis.md)。
 - **Line B**:采集 **L1**,跑脚本,用两种分析模式定位可见瓶颈。
 - **Line A (必做)**:通读源码(穿透框架),用四维度审视,发现结构性冗余。用 Line B 的数据量化收益。
-- 两条线**都必须执行**,产出合并后进入**确认节点 A**。
+- 两条线**都必须执行**,产出合并后进入**确认节点 A**（门禁详见 [execution_protocol.md](references/execution_protocol.md)）。
 
-**★ 确认节点 A**：向用户展示优化方案清单（每条含内容、预期收益、风险等级），询问方案是否合适、有无需要跳过的优化点。仅实施用户确认的条目。
-
-**Phase 3 优化实施**：根据用户确认的优化清单，用四维度（去重、复用、掩盖、替换）框架选择具体手段。每条优化后进行Level 1 快速精度验证。实施完成后，必须回溯 Phase 2 的所有结构化产出（热路径审计表、归因层 10 类浪费、根因追踪发现），逐行验证每个 actionable 条目是否已实施或附依据排除。详见 [execution_protocol.md](references/execution_protocol.md)「Phase 3 → Phase 4 门禁」。**任何未关闭的条目阻止进入 Phase 4。**
+**Phase 3 优化实施**：根据用户确认的优化清单，用四维度（去重、复用、掩盖、替换）框架选择具体手段，每条改动后做 Level 1 快速精度验证。全部实施后须通过「Phase 3 → Phase 4 门禁」——回溯 Phase 2 全部结构化产出做闭环检查，任何未关闭条目阻止进入 Phase 4——详见 [execution_protocol.md](references/execution_protocol.md)。
 
 **Phase 4 精度验证 + Profiling 确认**：本批（本轮优化阶段）所有优化完成后，**必须依次完成**：
 1. 全量精度验证（方法论见 [04_accuracy_assurance](04_accuracy_assurance/SKILL.md)）—— 与原始 baseline 对比，确认精度无退化
 2. 重新采集 **wall-clock + L0**（按 Phase 1 相同方法）—— wall-clock 确认真实收益，L0 与基线/上一轮比对确认收益来源（L0 Computing 和 L0 Free 的变化）
 3. 两项均通过后才可进入提交流程；任一不通过则回退或调整
 
-**★ 确认节点 B**：向用户展示本批总结（优化点、性能收益、精度数据、未采纳方案），询问是否确认提交。用户确认后才执行 git commit。
-
-**★ 确认节点 C（下一轮决策）**：提交完成后，向用户展示当前状态（累计收益、剩余 gap）并询问是否继续。若继续，**必须作为全新一轮执行**——上一轮的分析结论、未实施方案、优化方向全部作废，不可沿用。原因：优化改变了性能 profile，上一轮的瓶颈可能已不存在或已转移。
-
-**Phase 5 工程化提交**：全部工作在 optimize/ 分支进行，每批一个 commit，用户确认后合入 main。**必须先按 [06_evidence_db/schema.md](06_evidence_db/schema.md) 将本轮优化案例记录到项目工作目录的 `evidence_db/` 下（与 `profiling/` 同级），再执行 git commit**——案例未记录不允许提交（见确认节点 B 第 3 步）。
+**Phase 5 工程化提交**：全部工作在 optimize/ 分支进行，每批一个 commit，用户确认后合入 main。**必须先按 [06_evidence_db/schema.md](06_evidence_db/schema.md) 将本轮优化案例记录到项目工作目录的 `evidence_db/` 下（与 `profiling/` 同级），再执行 git commit**——案例未记录不允许提交（见 [execution_protocol.md](references/execution_protocol.md) 确认节点 B）。
 
 ## 迭代退出条件
 
-由用户在确认节点 C 中决定是否继续。agent 应基于下界分析（定义见 [bound_analysis.md](references/bound_analysis.md)）提供量化建议。满足以下**任一**条件时建议停止：
-
-1. `L0 Free < wall-clock × 10%`——device 几乎不停，优化空间在 device 侧，Python 层优化接近极限
-2. L0 Free > 0 但连续 2 轮优化均 < 2% wall-clock 改进——虽然 Free 仍存在但已无法有效消除
-3. 所有候选被拒绝且无新候选产生
+由用户在确认节点 C 中决定是否继续。agent 应基于下界分析提供量化建议：满足 [bound_analysis.md](references/bound_analysis.md)「终局判断」中**任一**条件时建议停止。
 
 终局判断前必须穷尽 NPU 融合算子库，不能仅看 utilization 数字下结论。

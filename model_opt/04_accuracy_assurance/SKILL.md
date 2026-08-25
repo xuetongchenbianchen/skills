@@ -1,6 +1,6 @@
 ---
 name: npu-accuracy-assurance
-description: 精度保证：基线管理、分层验证、精度调试。当用户需要验证优化后精度、对比 GPU/NPU 输出、对齐训练过程、或调试精度问题时触发。
+description: 精度保证：优化回归基线管理、分层验证、精度调试。当用户需要验证优化后精度、构建优化前后精度对比脚本、对齐训练过程、或调试精度问题时触发。
 ---
 
 # NPU 精度保证
@@ -33,12 +33,12 @@ description: 精度保证：基线管理、分层验证、精度调试。当用�
 
 精度对比的前提是有一个可信 baseline。来源不对，整个结论无效。
 
-**来源优先级**：官方基线（README/示例输出/benchmark）→ 用户指定基线（GPU 实际结果）→ NPU 优化前自身输出（仅推理场景）。不假定必须是 GPU 输出。CPU 结果仅用于调试辅助，不作为最终对齐结论。
+**基线语义（本子技能 = 优化回归）**：baseline 固定为**优化前 NPU 自身输出**，由 Phase 1 采集保存（见 [01_preparation/SKILL.md](../01_preparation/SKILL.md)「三、精度回归脚本构建」）。优化验证回答的是"优化有没有引入退化"，只要求优化前后对齐，**不依赖外部 golden**。与迁移前 golden（GPU/CPU 原始实现输出）的对齐属于 Phase 0 适配验证（见 [00_adaptation/SKILL.md](../00_adaptation/SKILL.md) 0.5），不在本阶段范围。
 
 **强制规则**：
-- 先确认基线来源，再写对比脚本
-- 官方基线不足时必须询问用户：是否已有 GPU 结果、结果目录位置、结果文件内容
-- 样例级对齐 ≠ 模型级对齐（官方示例只能证明示例范围内的对齐）
+- 始终与优化前的原始 baseline 对比，禁止与中间版本自比
+- 先确认 baseline 可用（文件齐全、输入一致），再写对比脚本
+- 样例级对齐 ≠ 模型级对齐（部分样本通过只能证明该范围内的对齐）
 
 **自一致性验证**：优化前必须验证 baseline 自身确定性——用相同输入运行原始模型两次，确认输出一致。若 baseline 不确定，精度对比的阈值必须大于 baseline 自身波动。
 
@@ -197,4 +197,4 @@ description: 精度保证：基线管理、分层验证、精度调试。当用�
 |------|------|----------|
 | [model_family_hints.md](references/model_family_hints.md) | 各模型类型的验证边界和度量详细说明 | 遇到不在速查表中的模型类型时 |
 | [debugging_guide.md](references/debugging_guide.md) | Level 3 精度调试的定位方法 | 验证不通过需要定位问题时 |
-| [baseline_policy.md](references/baseline_policy.md) | 基线确认的询问模板和报告措辞 | 需要询问用户或撰写结论时 |
+| [baseline_policy.md](references/baseline_policy.md) | baseline 完整性检查清单和报告措辞 | 使用 Phase 1 baseline 前或撰写结论时 |

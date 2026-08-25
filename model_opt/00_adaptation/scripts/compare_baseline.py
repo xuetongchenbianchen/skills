@@ -4,7 +4,7 @@
 
 用法示例:
     import sys
-    sys.path.insert(0, "/path/to/skills/model_adaptation/scripts")
+    sys.path.insert(0, "/path/to/skills/model_opt/00_adaptation/scripts")
     from compare_baseline import compare_tensors, compare_layerwise
 
     # 端到端对比
@@ -22,7 +22,7 @@ def compare_tensors(baseline, target, name="output", threshold_cosine=0.999, thr
 
     Args:
         baseline: 基准 tensor (CPU, 任意 dtype)
-        target: 待对比 tensor (CPU, 任意 dtype)
+        target: 待对比 tensor (NPU, 任意 dtype)
         name: 显示名称
         threshold_cosine: cosine 通过阈值 (默认 0.999 对应 fp16 单步)
         threshold_max_abs: max_abs 通过阈值

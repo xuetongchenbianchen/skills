@@ -12,6 +12,7 @@
     总章：优化空间与信号汇总
       1. 全局优化空间 (step_trace + L0 交叉验证)
       2. 信号清单 ([DEFINITE] / [SIGNAL] / [FUTURE])
+      3. 通信疑点 Top-K (有显著通信疑点时；含源码位置与置信度)
     --- 以下为细节章，供下钻时参考（首读可跳过）---
     A. 全局视角 (step_trace, + L0 交叉验证)
     B. 设备侧：算子分布 (op_statistic)
@@ -20,8 +21,7 @@
     E. 源码定位 (operator_details)
     F. 内存 (memory_record, operator_memory)
     G. CANN 运行时 (api_statistic)
-    H. 通信 (communication, 仅多卡时存在)
-    I. 跨 Rank 对比 (multi_rank, 仅当 profiling 目录含多个 rank_N 时)
+    H. 通信 (communication；多 rank 目录时自动含 H7 跨 Rank 对比与溯源)
 
 默认行为: 报告自动保存到 L1 profiling 目录下的 analysis_report.txt。
 """
@@ -45,7 +45,6 @@ import parse_memory_record
 import parse_operator_memory
 import parse_api_statistic
 import parse_communication
-import parse_multi_rank
 
 
 DIVIDER = "=" * 70
@@ -81,12 +80,13 @@ def _extract_step_trace_summary(profiling_dir: str, rank=None):
 
 
 def _extract_signals(text: str, section_label: str) -> list:
-    """从 parse 输出文本中提取 signal 行。
+    """从 parse 输出文本中提取 signal 行（同文本重复出现时只保留首条）。
 
     返回 [(level, section_label, signal_text), ...]
     level 为 "DEFINITE" / "SIGNAL" / "FUTURE"
     """
     signals = []
+    seen = set()
     for line in text.split("\n"):
         stripped = line.strip()
         if stripped.startswith("- "):
@@ -94,7 +94,9 @@ def _extract_signals(text: str, section_label: str) -> list:
         for tag in _SIGNAL_TAGS:
             if stripped.startswith(tag):
                 level = tag.strip("[]")
-                signals.append((level, section_label, stripped))
+                if stripped not in seen:
+                    seen.add(stripped)
+                    signals.append((level, section_label, stripped))
                 break
     return signals
 
@@ -262,22 +264,17 @@ def main():
     all_signals.extend(_extract_signals(sec_g, "G"))
     detail_sections.append(sec_g)
 
-    # H. 通信（仅多卡）
-    comm_path = ascend_dir / "communication.json"
-    matrix_path = ascend_dir / "communication_matrix.json"
-    if comm_path.exists():
-        sec_h = run_section("H. 通信（多卡）", parse_communication.parse, comm_path, matrix_path, 15)
+    # H. 通信（多卡；多 rank 目录时自动含 H7 跨 Rank 对比，函数自己找文件）
+    comm_suspects = None
+    if (ascend_dir / "communication.json").exists():
+        sec_h = run_section("H. 通信（多卡）", parse_communication.parse, l1_dir, rank, 15)
         all_signals.extend(_extract_signals(sec_h, "H"))
         detail_sections.append(sec_h)
-
-    # I. 跨 Rank 对比（仅当 profiling 目录含多个 rank_N 子目录时）
-    multi_rank_ranks = parse_multi_rank._discover_ranks(l1_dir)
-    if len(multi_rank_ranks) >= 2:
-        sec_i = run_section("I. 跨 Rank 对比（多卡）",
-                             parse_multi_rank.parse, l1_dir, 15,
-                             include_signals=False)
-        all_signals.extend(_extract_signals(sec_i, "I"))
-        detail_sections.append(sec_i)
+        # 疑点块切块上浮总章（H 节细节章保留完整版）
+        m_suspects = re.search(
+            r"<<<COMM_SUSPECTS>>>(.*?)<<<END_COMM_SUSPECTS>>>", sec_h, re.S)
+        if m_suspects:
+            comm_suspects = m_suspects.group(1).strip()
 
     # --- 组装报告 ---
     report_parts = []
@@ -299,6 +296,12 @@ def main():
     report_parts.append("")
     report_parts.append(_build_global_optimization_space(l1_summary, l0_summary))
     report_parts.append(_build_signal_summary(all_signals))
+
+    # 通信疑点 Top-K（来自 H 节，上浮至总章第 3 节）
+    if comm_suspects:
+        report_parts.append("## 3. 通信疑点 Top-K")
+        report_parts.append(comm_suspects)
+        report_parts.append("")
 
     # 细节章
     report_parts.append(DIVIDER)

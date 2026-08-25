@@ -38,15 +38,16 @@
 5. **内存带宽受限**——kernel 在搬数据而非算。信号：mte 占比远大于 mac、带宽利用率接近峰值。上限：带宽受限段的 device 时间。
 6. **compute 饱和**——计算密集且硬件已充分利用。信号：mac 高 + 并行度满 + 利用率高。上限：该 kernel 群 device 时间（且总可优化空间 <10% 时此类别为主）。
 7. **布局/格式转换**——运行时 transpose/cast/format 转换。信号：非 ND 格式占比高 / Transpose·Cast 类耗时多。上限：数据搬运类耗时占比。
-8. **通信同步等待**——通信时间花在等而非传。信号：通信 Wait 占比高。上限：通信等待时间。多卡场景下进一步细分：
-   - **等待型**：Wait >> Transfer，或某 rank 通信耗时远大于其他 → 负载不均、barrier 过频
-   - **冗余型**：同一张量短时间内被多次 AllGather，或 AllGather 结果立即被 slice 丢弃大部分 → 不必要重建全量
-   - **串行型**：通信 kernel 前后有设备 idle gap → 未使用异步通信流
-   - **原语不当型**：AllGather 收集全量但只读 1/P → 应改用 ReduceScatter 或本地计算
-   - **策略性通信**：通信量 ≈ O(L²) 或单次 > 100ms，通信源自收缩维度恰好是分片维度 → 分片策略本身导致，优化手段是重新选择分片策略而非加速通信
-   - **拓扑错配型**：跨节点通信（RoCE）占主导，逻辑上可调整到节点内 → group 分配不当
+8. **通信开销**——通信时间花在等（同步等待）或传得慢（带宽/协议）。信号：通信 Wait 占比高，或 Transit 主导但带宽低于同 size 档基准。上限：可消除的通信时间。细分（判读规则与判定工具见 [profiling_scripts_guide.md](profiling_scripts_guide.md) §parse_communication，脚本输出自带提示）：
+   - **等待型**——某 rank 计算侧慢导致其余 rank 等（straggler）；或同步点/barrier 过频
+   - **冗余型**——同一张量被重复通信（短时间多次 AllGather、AG 结果大量丢弃）
+   - **串行型**——通信可与独立计算重叠但调度串行；无独立计算则为依赖性串行，不可掩盖
+   - **原语不当型**——集合通信原语选错（AllGather 收全量但只读 1/P）
+   - **策略性**——通信量由分片策略本质决定（如收缩维度=分片维度），修法是重新分片而非加速通信
+   - **拓扑错配型**——跨节点通信逻辑上可调整到节点内
+   - **协议开销型**——消息被固定延迟主导（小包），修法是合并通信
 
-   > 通信瓶颈触发阈值：comm 列占总 step 时间 > 20%，或设备利用率 < 50% 且 comm 列有值，或多卡 wall-clock 加速比远低于理论。
+   > 触发阈值：comm 列占总 step 时间 > 20%，或设备利用率 < 50% 且 comm 列有值，或多卡 wall-clock 加速比远低于理论。慢链路 / RDMA 重传疑似属环境侧问题——产出环境报告候选，不进代码优化候选。
 9. **小算子碎片**——大量短 kernel 串行。信号：短 kernel 占比高、kernel 数极多。上限：碎片段累计耗时。
 10. **延迟未掩盖**——存在可并行的独立工作但未重叠。信号：device idle 但有可并行计算、多流并发占比低。上限：可掩盖的 idle/延迟。
 
@@ -88,6 +89,7 @@ Profiling 只能告诉你"哪个算子慢"，要动手优化必须先把它跨�
 | 桥 | 字段 / 文件 | 采集前提 | 作用 |
 |----|------------|---------|------|
 | **Call Stack** | `operator_details.csv` 的 `Call Stack` 列 | `activities` 含 CPU + `with_stack=True` | 唯一能把一次算子调用映射到 Python 源码函数/行号的字段 |
+| **通信算子 Call Stack** | `operator_details.csv` 的 `Hccl*` 行（文件序对齐）或 `trace_view.json` 的 `Hccl*` cpu_op 事件（ts 对齐），经 `parse_communication.py --trace-source` 回链 | 同 Call Stack 桥（`with_stack=True`） | hcom 通信算子（device 侧 kernel）在 operator_details.csv 中无直接行，其 host 侧调用记录为 `Hccl*` 行/事件——按序号或 ts 对齐把两者桥接后获得调用通信的源码位置 |
 | **Input Shapes** | `kernel_details.csv` / `operator_details.csv` 的 `Input Shapes` 列 | `record_shapes=True` | 区分同一算子类型的不同调用点；Call Stack 断桥时，可从 shapes 反推计算语义（如 one-hot 向量 × 权重 = gather） |
 | **下发时序** | `trace_view.json` 的 HostToDevice flow、`Node@launch` 的 `connection_id`、`async_npu(torch_to_npu)` flow、`AscendCL@opCompile` 事件（`parse_trace_view.py`） | NPU 采集即有；Python 调用栈/源码映射需 `with_stack=True` | host→device 下发链与在线编译停顿（A 预热 / B 每步）。`async_npu` flow 本身携带 `cpu_op` 的 Call Stack，因此下发时序是包含 Call Stack + host-device 时序关系的 richer 数据源——适合 host-device 交互类问题（如设备空等、下发延迟），而非"某个慢算子"类问题。**NPU 推理场景注意**：异步流水线（TASK_QUEUE_ENABLE=2）下 host-device 时序 gap 可能是 profiler 伪影，需先用 L0 交叉验证确认 gap 真实性再做因果推断 |
 

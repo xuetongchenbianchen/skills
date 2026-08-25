@@ -43,38 +43,43 @@ Kerminal 会在启动时扫描 `~/.kerminal/skills/` 下的所有 `SKILL.md`，�
 ```
 OPT-Skills/
 ├── README.md
-├── model_opt/                        # 主 Skill：NPU 模型适配全流程优化
-│   ├── SKILL.md                      # 全流程、确认节点、子 skill 索引
-│   ├── references/
-│   │   └── standardized_operations.md    # Profiling 采集与精度对比规范
-│   ├── 01_preparation/               # Phase 1：环境搭建、数据准备、脚本构建
-│   ├── 02_profiling_analysis/        # Phase 2：Profiling 数据分析 + 源码根因定位
-│   ├── 03_optimization/              # Phase 3：基于三原语的优化实施
-│   ├── 04_accuracy_assurance/        # Phase 4：推理/训练精度验证
-│   ├── 05_engineering/               # Phase 5：Git 管理、日志、文档
-│   └── 06_evidence_db/               # Phase 6：优化证据库
+├── model_opt/                        # 主 Skill：NPU 模型适配与性能优化全流程
+│   ├── SKILL.md                      # 全流程、启动协议（含适配状态判定）、确认节点、子 skill 索引
+│   ├── references/                   # 标准化操作、执行协议、下界分析等公共规范
+│   ├── 00_adaptation/                # Phase 0：模型适配（环境/权重/推理实现/冒烟 OOM 分诊/golden 对齐）
+│   ├── 01_preparation/               # Phase 1：测试数据、基线采集与验证脚本构建
+│   ├── 02_bottleneck_analysis/       # Phase 2：源码结构线 + Profiling 数据线双线分析
+│   ├── 03_optimization/              # Phase 3：基于四维度（去重/复用/掩盖/替换）的优化实施
+│   ├── 04_accuracy_assurance/        # Phase 4：优化精度回归验证
+│   ├── 05_engineering/               # Phase 5：Git 分支与提交纪律、性能数据校验、文档维护
+│   ├── 06_evidence_db/               # 案例库：优化证据记录（schema 定义）
+│   └── 07_parallel_splitting/        # 条件轨道：多卡并行切分（Phase 0 冒烟分诊触发）
 │
 ├── opt_explore/                      # 辅助 Skill：代码探索与上下文分析
 │   ├── SKILL.md
 │   └── references/
 │
-└── docs/                             # 开发日志（不需要可跳过）
-    ├── profiling_update_records/
-    └── system_improvement_records/
+└── docs/                             # 开发日志（不需要可跳过，索引见 docs/README.md）
 ```
+
+全流程：**Phase 0 模型适配**（已适配模型经启动判定跳过）→ **Phase 1 基线准备** → **Phase 2–4 优化迭代**（瓶颈分析 → 优化实施 → 门禁验证）→ **Phase 5 工程化提交**；显存不足时经 Phase 0 冒烟分诊进入 **07 并行切分** 条件轨道。详见 `model_opt/SKILL.md`。
 
 ## Profiling 解析脚本
 
-`02_profiling_analysis/scripts/` 提供 7 个 CANN profiling CSV 解析工具：
+`02_bottleneck_analysis/scripts/` 提供 CANN profiling CSV 解析工具：
 
 | 脚本 | 对应文件 | 用途 |
 |------|---------|------|
-| `parse_step_trace.py` | step_trace_time.csv | 设备利用率，判断瓶颈侧 |
-| `parse_op_statistic.py` | op_statistic.csv | 算子耗时分布 + 异常检测 |
-| `parse_kernel_details.py` | kernel_details.csv | 硬件单元、小算子、流水 stall |
+| `run_analysis.py` | 全部 CSV/JSON | 统一入口：串联各 parse 脚本，输出两段式报告（总章信号清单 + 细节章 A~H），自动做 L0/L1 交叉验证（多 rank 目录自动含跨 Rank 对比） |
+| `parse_step_trace.py` | step_trace_time.csv | 每 step 的 device 利用率，判断瓶颈侧 |
+| `parse_op_statistic.py` | op_statistic.csv | 全局算子耗时分布 |
+| `parse_kernel_details.py` | kernel_details.csv | 逐 kernel 执行详情（硬件单元耗时拆分） |
 | `parse_operator_details.py` | operator_details.csv | Host 开销 + Call Stack 源码定位 |
-| `parse_memory_record.py` | memory_record.csv | 内存时间线、碎片化 |
-| `parse_operator_memory.py` | operator_memory.csv | 逐 tensor 生命周期 |
+| `parse_operator_memory.py` | operator_memory.csv | 逐 tensor 分配生命周期分析 |
+| `parse_memory_record.py` | memory_record.csv | 内存使用时间线、碎片化 |
+| `parse_api_statistic.py` | api_statistic.csv | CANN runtime (ACL) API 调用耗时统计 |
+| `parse_communication.py` | communication.json / matrix（+ 溯源数据源） | 多卡通信统一分析：源码溯源（hcom→Hccl→Call Stack）、Matrix 判读、跨 Rank straggler 定位（多 rank 目录自动）、带宽自基准 |
+| `parse_trace_view.py` | trace_view.json | 时间线 / dispatch 链分析 |
 | `diff_profiling.py` | 两份 profiling 对比 | 优化前后效果验证 |
 
 所有脚本的统一接口：
@@ -83,7 +88,7 @@ OPT-Skills/
 python <script>.py <profiling_dir> [--rank N] [--top-k K] [--output file.txt]
 ```
 
-`parse_kernel_details.py` 和 `parse_operator_details.py` 支持 `--filter` 模式对特定算子深入分析。
+`parse_kernel_details.py`、`parse_operator_details.py` 和 `parse_trace_view.py` 支持 `--filter` 模式对特定算子深入分析；`parse_communication.py` 支持 `--trace-source` 单算子溯源。
 
 ## 贡献指南
 
@@ -93,7 +98,7 @@ python <script>.py <profiling_dir> [--rank N] [--top-k K] [--output file.txt]
 2. **渐进式加载**：只在 `description` 中声明触发条件，不在 SKILL.md 中堆叠所有知识
 3. **脚本做确定性工作**：可重复执行、输出稳定的操作用脚本；需要判断力的工作留给 Agent
 4. **不做项目特定绑定**：references 和 scripts 中不硬编码项目路径或正则匹配特定代码
-5. **经验可积累**：`npu_checklist.md`、`npu_operator_reference.md` 等文件可以持续增加条目
+5. **经验可积累**：`npu_checklist.md`、`npu_operator_catalog.yaml` 等文件可以持续增加条目
 
 ### 修改规范
 
@@ -122,8 +127,8 @@ python <script>.py <profiling_dir> [--rank N] [--top-k K] [--output file.txt]
 
 ```bash
 # profiling 解析脚本示例
-python 02_profiling_analysis/scripts/parse_op_statistic.py /path/to/profiling
-python 02_profiling_analysis/scripts/parse_kernel_details.py /path/to/profiling --filter MatMul --top-k 5
+python 02_bottleneck_analysis/scripts/run_analysis.py /path/to/l1_dir --l0-dir /path/to/l0_dir
+python 02_bottleneck_analysis/scripts/parse_kernel_details.py /path/to/profiling --filter MatMul --top-k 5
 ```
 
 确保：

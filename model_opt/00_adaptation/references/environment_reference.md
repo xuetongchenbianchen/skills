@@ -1,6 +1,6 @@
 ---
 name: CANN 环境配置参考
-description: CANN 环境详细诊断命令、版本确认、环境变量清单与常见报错解决方案。作为 NPU 适配前期准备的次级参考文件。
+description: CANN 环境详细诊断命令、版本配套表、环境变量清单、常见报错与推理适配精度坑。作为 Phase 0 模型适配（00_adaptation）与 profiling 采集的次级参考文件。
 ---
 
 # CANN 环境配置参考
@@ -69,6 +69,8 @@ print("torchair 版本:", torchair.__version__)
 | `LD_PRELOAD` | 高性能 malloc | `libjemalloc.so` 或 `libtcmalloc.so` | 减少 Python 内存分配开销（`empty_tensor` 高频场景显著） |
 | `PYTORCH_NPU_ALLOC_CONF` | NPU 内存池策略 | `expandable_segments:True` | 减少 NPU 内存碎片，降低 allocator 同步阻塞 |
 | `HCCL_BUFFSIZE` | 通信缓冲区大小（MB） | `32` | 多卡场景优化，单卡推理不需要 |
+| `HCCL_CONNECT_TIMEOUT` | HCCL 跨节点连接超时（秒） | `600` | 多卡**跨节点**防连接超时，单机不需要 |
+| `MULTI_STREAM_MEMORY_REUSE` | 多流内存复用 | `1` | 通信流内存提前释放给计算流复用，多流重叠场景建议开启 |
 
 > `TASK_QUEUE_ENABLE=2` 不开启则每个 kernel 都要等 host 确认，profiling 中表现为 wait time 均匀分布在所有 kernel 上。
 > `LD_PRELOAD` 优先用 `libtcmalloc.so`，若系统未安装可用 CANN 自带的 `libjemalloc.so`（路径如 `~/Ascend_local/cann-8.5.0/aarch64-linux/lib64/libjemalloc.so`）。

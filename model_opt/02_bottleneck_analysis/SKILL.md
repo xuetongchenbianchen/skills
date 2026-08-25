@@ -27,7 +27,6 @@ Phase 2 的分析由两条线驱动,顺序执行:
 - Line B 先做(脚本快,秒出结果),其数据供 Line A 做量化
 - 两条线的产出都是"问题定位"(问题 + 位置 + 影响范围),不是方案
 
-> 显存容量/多卡切分的判定已前移至 Phase 1（见 [01_preparation/SKILL.md](../01_preparation/SKILL.md)「多卡切分前置判定」）。Phase 2 不再设容量分诊线，专注 Line A/B 两条线。
 
 ## Line A: 源码分析
 
@@ -43,7 +42,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
 ## Line B: Profiling 分析
 
 **流程**:
-1. 采集 L1 profiling（使用 Phase 1 选定的生产中位样本，见 [01_preparation/SKILL.md](../01_preparation/SKILL.md) 第四节）
+1. 采集 L1 profiling（使用 Phase 1 选定的生产中位样本，见 [01_preparation/SKILL.md](../01_preparation/SKILL.md) 第一节）
 2. **下界分析（前置步骤）**：在跑脚本之前，先估算优化空间。详见 [bound_analysis.md](../references/bound_analysis.md)。
 
    - 读取 L0 Computing（kernel 执行时间）和 L0 Free（device 空闲时间）。
@@ -51,7 +50,7 @@ Phase 2 的分析由两条线驱动,顺序执行:
    - **不可压缩下界**通过跨轮次观察 L0 Computing 变化趋势逼近（持续下降说明有空间，连续 2 轮不下降说明到达下界）。
    - 不在此处判定优化方向——"空间在哪、怎么缩小"由后续 profiling 脚本分析确定。
 
-3. 运行 `run_analysis.py`（统一入口）提取结构化数据，输出两段式报告：**总章**（全局优化空间 + 信号清单，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组）+ **细节章**（A~I 节完整 statistics，供下钻参考；I 节仅多卡场景出现）。总章自动包含 L0/L1 交叉验证（传入 `--l0-dir` 时对比 L0 和 L1 的 step_trace，未传入时标注"未经交叉验证，须谨慎"）。L0 来源：第 0 轮用 Phase 1 基线 L0；第 i 轮用第 i-1 轮 Phase 4 的 L0。各脚本输出含义详见 [profiling_scripts_guide.md](references/profiling_scripts_guide.md)
+3. 运行 `run_analysis.py`（统一入口）提取结构化数据，输出两段式报告：**总章**（全局优化空间 + 信号清单 + 通信疑点 Top-K，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组）+ **细节章**（A~H 节完整 statistics，供下钻参考；多卡目录时 H 节自动含跨 Rank 对比）。总章自动包含 L0/L1 交叉验证（传入 `--l0-dir` 时对比 L0 和 L1 的 step_trace，未传入时标注"未经交叉验证，须谨慎"）。各脚本输出含义详见 [profiling_scripts_guide.md](references/profiling_scripts_guide.md)
 4. **推理与根因追踪（强制，覆盖所有显著发现，不可跳过）**：阅读完整报告后，用 [profiling_to_action.md](references/profiling_to_action.md) 的两种分析模式（横向关联 + 纵向深入）从信号组合定位瓶颈类型（现象→归因），再通过三座桥（Call Stack、Input Shapes、下发时序）从 profiling 数据定位到**源码中的具体代码位置**，沿调用链追溯根因。定位到源码后回答：**这段代码为什么导致了这个 profiling 现象？**
 
    "显著"的判定标准 = 脚本自身输出的 DEFINITE 信号 / WARNING 警告，或占比超过脚本定义的阈值。
@@ -63,6 +62,8 @@ Phase 2 的分析由两条线驱动,顺序执行:
    - Host 开销分类中的"other"占比高（来自 operator_details）→ 该类别是未归类的 host 操作聚合 → 按 host self time 排序找到具体算子 → `--filter` 追 Call Stack
    - 内存高频抖动（来自 memory_record / operator_memory）→ 重复同尺寸分配列表 → 对应算子的 Call Stack → 定位哪个操作在反复分配/释放
    - AI_CPU 回退（来自 op_statistic Core Type 分布）→ `--filter <op>` 获取 Input Shapes → 判断 dtype/shape 是否不匹配导致 fallback
+   - straggler 信号（多卡目录时来自 H 节 H7 跨 Rank 对比：某 rank 在多数高 wait 算子上 wait 最小 = 最后到达的被等者）→ 该 rank 计算侧慢：对其跑单卡脚本（A~H 节，`--rank N`）重复本流程定位瓶颈
+   - 通信疑点（H 节疑点块 / 总章 §3，多卡目录时出现）→ `--trace-source <op>` 溯源到调用通信的源码位置（置信度 [ALIGNED]/[RISKY]/[AGGREGATED] 随行）→ 按归因层 #8 细分产出候选。通信判读规则见 [profiling_scripts_guide.md](references/profiling_scripts_guide.md) §parse_communication
 
    **执行规则**：
    - 每个脚本运行后，先记录该脚本产出的所有 DEFINITE/WARNING 信号
@@ -78,20 +79,6 @@ Phase 2 的分析由两条线驱动,顺序执行:
 5. 确认根因后,产出候选清单(每条含:问题 + 位置 + 影响范围 + 反事实收益上限)。候选评估方法见 [profiling_to_action.md](references/profiling_to_action.md) §候选评估：反事实收益上限。
 
 如需对单个脚本做 `--filter` 深入查询（如 `parse_operator_details --filter Transpose` 获取 Call Stack），可单独调用对应脚本。
-
-### 多卡场景专项分析
-
-当 profiling 目录包含 `rank_0/` ~ `rank_N/` 子目录时，`run_analysis.py` 自动检测并运行 Section I（`parse_multi_rank.py`），跨所有 rank 对比分析。多卡分析遵循四阶段方法论，详见 [multi_rank_analysis_guide.md](references/multi_rank_analysis_guide.md)：
-
-1. **Phase 1 慢卡定位**：`(T_max-T_avg)/T_avg > 10%` = Tail Card；通信域推断（DP/TP/PP/EP）
-2. **Phase 2 重叠分析**：`Overlapped/Total < 5%` = 严重并行瓶颈；假性重叠检测
-3. **Phase 3.4 通信深度**：`R_wait = 1-(T_avg/T_max) > 30%` = 同步慢卡；小包/字节对齐检查
-4. **Phase 5 MoE 专项**：AlltoAll 跨 rank `CV > 0.2` = 负载不均衡（Expert Imbalance）
-
-多卡场景的 DEFINITE 信号（慢卡、通信不均衡、R_wait、AlltoAll 不均衡）同样需要根因追踪：
-- 慢卡 → 聚焦该 rank 的单卡分析（A~H 节）找具体瓶颈
-- 通信不均衡 → 查 Wait/Transit 拆解，判断是同步瓶颈还是带宽瓶颈
-- AlltoAll 不均衡 → 查 MoE 路由算法/专家容量因子
 
 **门禁规则**：
 - 报告中任何 **DEFINITE** 信号或 **WARNING 警告**（由脚本自身定义，如"严重 Host-Bound"、"AI_CPU Fallback"、"高内存 churn"）**必须**在确认节点 A 中产生对应候选，或附 profiling 数据依据显式排除

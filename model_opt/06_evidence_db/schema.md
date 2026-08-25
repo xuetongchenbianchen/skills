@@ -23,7 +23,8 @@
     # 无依赖则省略
 
   phenomenon:
-    # 记录 agent 从 profiling 中观察到的所有相关信号,尽可能完整
+    # 记录 agent 观察到的所有相关信号,尽可能完整
+    # (优化案例来自 profiling;切分案例来自冒烟测试/OOM 分诊)
     signals:
       - source: <string>  # 产出此信号的脚本名+参数,如 "parse_op_statistic" 或 "parse_kernel_details --filter Transpose"
         content: <string>  # 脚本输出的原文摘录(关键数值+判断),不做解读,只记事实
@@ -48,41 +49,49 @@
       # 不明确或属于多种: 写 "mixed" 并在 description 中说明
     evidence: <string>  # 支撑此根因判断的关键证据
 
+  parallel_splitting: <object, optional>
+    # 多卡切分案例专用字段(07_parallel_splitting 轨道)。切分是独立于优化循环的前置结构变更
+    # (发生在 Phase 2 之前),不记在 optimization.attempts 里——切分完成时写独立的切分案例,
+    # 后续优化案例用 depends_on 指向它。填写本节的案例,optimization 节留空;反之亦然。
+    split_position: <string>  # input（输入边界）/ module（模型内部），见 07_parallel_splitting「切分怎么接入模型」
+    split_dimension: <string>  # horizontal / vertical
+    implementation_mode: <string>  # 输入边界编排 / monkey-patch / 子类覆写 / 源码内嵌（替换机制）
+    tensor_distribution_table:
+      # 逐张量声明分布方式。须覆盖所有大张量及其配套张量（mask/index/
+      # position_ids 等）——配套漏切是实测高频错误；未声明 = 潜在 bug
+      - tensor: <string>
+        global_shape: <list[int]>
+        distribution: <string>
+        per_card_shape: <list[int]>
+        consumer_op: <string>
+        recovery_comm: <string>
+    quantitative:
+      single_card_peak_bytes: <int>
+      per_card_peak_after_split_bytes: <int>
+      hbm_bytes: <int>
+      communication_volume_bytes: <int>
+      communication_time_ms: <float>
+      break_even: <string>  # 通信耗时 vs 计算节省的对比结论
+    proofs:
+      - operation: <string>
+        equivalence_proof: <string>  # 切分等价性论证
+        lower_bound_comm_bytes: <int>  # 理论通信下界
+        actual_comm_bytes: <int>  # 实际通信量
+        ratio: <float>  # actual / lower_bound，< 1.0 说明估算有误
+    verification:
+      method: <string>  # verify_split.py + split-type；缩配 baseline 注明缩配参数
+      result: <string>  # verify_report 摘要（overall + 各 tier 结论）
+    known_pitfalls:
+      - pitfall: <string>
+        mitigation: <string>
+    rollback: <string>  # 恢复机制，如 disable_parallel() / git revert
+
   optimization:
     attempts:
       - description: <string>  # 做了什么改动
         dimension: <string, optional>
           # eliminate_redundancy / reuse_and_precompute / hide_latency / equivalent_substitution
         implementation_detail: <string>  # 具体代码层面怎么改的(文件、函数、改法)
-        parallel_splitting: <object, optional>
-          # 并行切分专用字段。仅当本案例涉及多卡切分时填写。
-          split_position: <string>  # input / module / special
-          split_dimension: <string>  # horizontal / vertical
-          implementation_mode: <string>  # A(外部编排) / B(Monkey-Patch) / C(子类覆写) / D(源码内嵌)
-          tensor_distribution_table:
-            - tensor: <string>
-              global_shape: <list[int]>
-              distribution: <string>
-              per_card_shape: <list[int]>
-              consumer_op: <string>
-              recovery_comm: <string>
-          quantitative:
-            single_card_peak_bytes: <int>
-            per_card_peak_after_split_bytes: <int>
-            hbm_bytes: <int>
-            communication_volume_bytes: <int>
-            communication_time_ms: <float>
-            break_even: <string>  # 通信耗时 vs 计算节省的对比结论
-          proofs:
-            - operation: <string>
-              equivalence_proof: <string>  # 切分等价性论证
-              lower_bound_comm_bytes: <int>  # 理论通信下界
-              actual_comm_bytes: <int>  # 实际通信量
-              ratio: <float>  # actual / lower_bound，< 1.0 说明估算有误
-          known_pitfalls:
-            - pitfall: <string>
-              mitigation: <string>
-          rollback: <string>  # disable_parallel() / cleanup_all_patches() / git revert
         equivalence_verification:
           method: <string>  # 怎么验证等价性的
           metrics: <list, optional>
@@ -135,7 +144,7 @@
 1. **完整优先**: 不确定某信息是否有用时,记下来。optional 字段能填就填。
 2. **原文摘录**: phenomenon.signals.content 和 analysis_path.steps.observation 尽量贴脚本原始输出。
 3. **失败必记**: optimization.attempts 中 rejected 的方案和 failure_reason 是最有价值的信息。
-4. **一次优化阶段一个文件**: 每经过一轮完整的 Phase 2->4,写一个案例文件。
+4. **切分与优化分开记录**: 多卡切分完成时写一个**切分案例**(填 `parallel_splitting` 节,`optimization` 留空);每经过一轮完整的 Phase 2->4 写一个**优化案例**(填 `optimization.attempts`,切分模型上的优化用 `depends_on` 指向所基于的切分案例)。
 5. **不强求归类**: bottleneck_type 和 dimension 能判断就写,判断不了写"mixed"并在 description 中说明。
 6. **平台发现独立记录**: NPU 特有的行为洞察写在 platform_findings 中,不要埋在 notes 或 failure_reason 里——这些发现跨越单个案例,对后续项目有指导价值。
 

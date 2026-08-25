@@ -1,203 +1,50 @@
 ---
 name: npu-adaptation-preparation
-description: NPU 适配前期准备：代码理解、CANN 环境搭建、测试数据、profiling 采集与精度验证脚本构建。当用户需要把模型在 NPU 上跑通、搭建/诊断 CANN 环境、采集基线 profiling、或构建精度对比脚本时触发。
+description: Phase 1 基线准备：测试数据构造（性能 regime 代表 + 精度覆盖）、profiling 采集体系构建、精度回归脚本构建。当用户需要采集基线 profiling、构造测试数据、或构建优化前后精度对比脚本时触发。
 ---
 
-# NPU 适配前期准备
+# NPU 优化基线准备
 
----
-
-## 一、模型代码理解
-
-**目标**：摸清推理路径，避免在错误位置改代码。
-
-### 系统性探索顺序
-从全局到局部：包入口（`__init__.py`）→ 模型类定义（含 forward）→ 推理入口（main/CLI/pipeline）。关注 config.json 中的架构参数（hidden_size, num_layers, num_heads 等）。
-
-### 已有文档阅读
-- 阅读项目 README、设计文档
-- 若有已有适配文档（如其他版本、同系列模型），列出差异点：**可复用 vs 需纠偏**
-
-### 特殊输入识别
-- 非文本输入（图像、蛋白质序列、音频等）需确认预处理路径和 tokenizer/encoder 是否独立
-- 检查 `collate_fn` / `DataCollator` 是否有设备绑定逻辑
+> 模型跑通（环境搭建、权重获取、推理实现、OOM 分诊）属于 Phase 0 → [00_adaptation/SKILL.md](../00_adaptation/SKILL.md)。本子技能只负责：为优化阶段准备可复现的基线数据与验证脚本。
 
 ---
 
-## 二、环境准备
+## 一、测试数据准备
 
-完整环境变量清单见 [environment_reference.md](references/environment_reference.md)。
+数据集服务两个目标，构造判据不同：
 
-### CANN 环境诊断
-```bash
-npu-smi info                          # 芯片型号、驱动版本、卡数、空闲卡
-ls $ASCEND_HOME_PATH/opp/             # OPP 算子包
-source ~/Ascend/ascend-toolkit/latest/set_env.sh  # 激活工具链
-```
+- **性能数据**（profiling 采集、wall-clock/L0 基线与收益比对）：核心判据是**场景之间是否带来不同的性能表现**。量小——每个性能 regime 一条代表，通常总共只有几条
+- **精度数据**（优化回归验证，防精度跑偏；Phase 0 golden 采集同样适用）：核心判据是覆盖可能暴露正确性问题的维度
 
-### 多卡管理
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3   # 逻辑编号从 0 开始，可能与物理编号不一致
-```
+### 性能数据：按性能 regime 覆盖
 
-### 版本配套确认
-```python
-import torch, torch_npu, torchair
-print(torch.__version__, torch_npu.__version__, torchair.__version__)
-# CANN 版本：cat $ASCEND_HOME_PATH/version.cfg
-```
-> 版本不配套是最常见的环境问题，优先确认 torch_npu 与 CANN 版本对应表。
+识别会产生**质变性能表现**的场景，每个 regime 选 1 条代表输入：
 
-### 设备兼容层（init_device 模板）
+| 性能维度 | 说明 | 判断 |
+|---------|------|------|
+| 输入规模档位 | 长度改变瓶颈结构时才分档（如 attention 占比随长度质变） | 同 regime 内 shape 差异只带来线性缩放，无需多采 |
+| Batch 形态 | bs=1 vs bs>1、不同 padding 比例 | kernel 选择与访存模式可能不同 |
+| 推理路径 | prefill vs decode、触发不同代码分支 | 不同分支 = 不同 kernel 序列 |
 
-```python
-def init_device(device_str: str):
-    if device_str.startswith("npu"):
-        import torch_npu
-        torch.npu.set_compile_mode(jit_compile=False)
-        torch_npu.npu.config.allow_internal_format = False
-    return torch.device(device_str)
-```
+判据：两个场景的瓶颈画像（算子序列、L0 Computing/Free 结构）是否**质变**。质变才单独立 regime，线性缩放归入同一 regime。典型规模：2–5 条。
 
-> 默认关闭 jit_compile 和 allow_internal_format 确保确定性。若 profiling 显示相关瓶颈，可逐个开启并验证精度无退化。
+**统计稳定性靠重复测量，不靠样本量**：wall-clock 对同一条输入重复 ≥20 次取中位数（见 [profiling_collection.md](references/profiling_collection.md)），禁止用扩充样本数替代重复测量。
 
----
+### 精度数据：按正确性风险覆盖
 
-## 三、项目 Git 初始化
-
-```bash
-cd /path/to/project
-git init
-git checkout -b optimize/main
-```
-
-### .gitignore 必须覆盖的大文件
-
-```gitignore
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.ckpt
-*.h5
-profiling/
-*.prof
-*.trace.json
-ASCEND_PROFILER_OUTPUT/
-__pycache__/
-*.pyc
-kernel_meta/
-.venv/
-```
-
----
-
-## 四、测试数据准备
-
-**原则**：小而代表性，显式覆盖多个维度，不能只按长度分桶。
-
-### 覆盖性检查清单
-
-构造或抽样时逐项确认，每个维度至少 1-2 条代表：
-
-| 维度 | 说明 | 示例 |
-|------|------|------|
-| **输入规模** | 最短、中位、最长 | 1 token / 512 / 2048 |
-| **Batch 形态** | batch=1 和 batch>1；不同 padding 比例 | 全填充 / 混合长度 |
-| **边界条件** | padding 边界、mask 形状、空/极短输入 | 全 pad、仅 1 有效 token |
-| **数值范围** | 正常 + 极值（接近 dtype 上溢/下溢） | fp16 max 附近值 |
-| **语义多样性** | 不同任务域/场景/输入类型 | LLM：代码/数学/对话/长上下文 |
-| **推理路径** | 触发不同代码分支 | prefill vs decode；有/无目标 |
-
-### 性能测试集
-
-统计稳定的端到端时间测量。选取标准：
-- 代表真实分布（有生产日志则按真实分布抽样）
-- 50–200 条，含 warmup（前 N 条不计入统计）
-- 用于优化前后对比 wall-clock 均值和 P95
+覆盖可能暴露正确性问题的维度，每个维度至少 1-2 条代表：边界条件（padding 边界、mask 形状、空/极短输入）、输入规模最短/中位/最长。
 
 ### L1 Profiling 样本
 
-从性能测试集中选 1 条生产 shape 分布的中位样本用于 L1 采集。L1 数据量大（可达数 GB）、分析重，只需落在生产主流瓶颈 regime 内即可——同 regime 内的 shape 差异只带来线性缩放，不改变瓶颈画像结构，无需多采。
+从性能数据中选生产主流 regime 的代表（生产 shape 分布的中位样本）1 条用于 L1 采集。L1 数据量大（可达数 GB）、分析重，同 regime 内无需多采。
 
-L0 + wall-clock 在性能测试集上跨 shape 采集作为兜底：每轮优化后验证收益时，若某 shape 的 L0 结构（L0 Free / L0 Computing 比例）与主流 regime 质变，或优化收益不符预期，再对该 shape 做 targeted L1。精度校验独立用丰富数据集覆盖多维 shape/content。
-
----
-
-## 多卡切分前置判定（条件触发）
-
-第一节代码理解完成后，即可从模型规模与运行需求初判单卡 HBM 是否够用。**若单卡放不下，必须先完成多卡切分再采集 profiling——否则基线脚本根本跑不通**。大量"需要并行"的诉求源于配置不当，纠正后单卡即可运行——先在本节完成下方分诊，**只有确认"本质需要并行"后才去阅读 [07_parallel_splitting/SKILL.md](../07_parallel_splitting/SKILL.md)**。
-
-### 分诊决策树
-
-```
-单卡 HBM 不足（代码估算或运行 OOM）
-├─ Step 1: 外部因素排查 → 命中 → 修复，不触发并行
-├─ Step 2: 显存预算估算 → 理论峰值 < HBM × 0.8 → 仍有外部因素，回 Step 1
-└─ Step 3: 理论峰值 > HBM × 0.8（排除外部因素后）→ 本质需要并行
-```
-
-### 外部因素排查清单（按频率排序）
-
-| # | 检查项 | 命中表现 | 修复 |
-|---|--------|---------|------|
-| 1 | 注意力融合未开启 | attention score 矩阵实体化 | 启用融合注意力算子 |
-| 2 | 内存碎片 | `max_memory_allocated` 远大于 `memory_allocated` | 调整分配策略 + tcmalloc |
-| 3 | 序列/Batch 配置不当 | padding 浪费 / 迭代步数过多 | 调整配置 |
-| 4 | 全量张量未释放 | 通信缓冲区持续存活，抵消切分收益 | 及时 `del`，复用缓冲区 |
-| 5 | 混合精度未启用 | FP32 每张量翻倍 | 切 BF16 / 量化 |
-| 6 | 环境配置 | 设备数不匹配 / 框架版本不配套 | 修正环境变量 |
-
-### 显存预算估算
-
-1. 识别模型中的**主导张量**——随输入规模超线性增长的张量（如 attention score、KV cache）
-2. 沿 forward 路径估算各模块峰值显存（主导张量 + 常驻部分如参数、优化器状态）
-3. 判定：若估算峰值 > HBM × 0.8（排除外部因素后）→ 本质需要并行
-
-> 0.8 阈值留出碎片与临时开销余量，可根据实际框架行为调整。
-
-### 分诊结论
-
-- **外部因素** → 修复后单卡即可，继续第五节正常采集 profiling
-- **本质需要并行** → 进入 [07_parallel_splitting/SKILL.md](../07_parallel_splitting/SKILL.md) 全流程（分析 → 实施 → 验证）；切分验证通过后回归第五节，完成带 profiling 的并行推理脚本并采集并行基线，再进入 Phase 2
-
-> 简单数据并行（DP only，多独立样本）不属于模型并行，直接配置 `ASCEND_RT_VISIBLE_DEVICES` 多卡即可（设计见 [parallel_design.md](../03_optimization/references/parallel_design.md)），不触发本流程。
+每轮优化后验证收益时，若某 regime 的 L0 结构（L0 Free / L0 Computing 比例）与主流 regime 质变，或该 regime 的优化收益不符预期，再对该 regime 做 targeted L1。精度校验独立用精度数据集覆盖多维 shape/content。
 
 ---
 
-## 五、Profiling 采集体系构建
+## 二、Profiling 采集体系构建
 
-完整代码模板和框架适配方案见 [profiling_collection.md](references/profiling_collection.md)。
-
-### 输出路径规范
-
-```
-<workspace>/profiling/
-├── YYYYMMDD_HHMMSS/
-│   ├── *.csv
-│   └── trace_view.json
-└── latest -> YYYYMMDD_HHMMSS
-```
-
-强制规则：必须用 `tensorboard_trace_handler` + 时间戳路径；禁止 `/tmp`；禁止 `export_chrome_trace`（不产出 `step_trace_time.csv`）。
-
-### 采集级别
-
-| 级别 | 内容 | 数据量 |
-|------|------|--------|
-| **L0** | 仅 NPU 活动 | 小 |
-| **L1** | CPU + NPU + 算子详情 + 调用栈 + 内存 + AI Core 指标 | 大 |
-
-### 三种性能测量
-
-wall-clock（无 profiler 真实时间）、L0（设备执行时间）、L1（瓶颈分析数据）。三者**必须覆盖完全相同的代码范围**。
-
-### 采集前必设
-
-```bash
-export TASK_QUEUE_ENABLE=2    # Host-Device 异步流水，接近生产环境真实性能
-export CPU_AFFINITY_CONF=1    # CPU 绑核，减少调度抖动
-```
+采集级别（L0/L1）、三种性能测量及其覆盖范围、输出路径规范、采集前环境变量、完整代码模板与框架适配方案，统一见 [profiling_collection.md](references/profiling_collection.md)（唯一权威源）。
 
 ### 关键规则
 
@@ -214,13 +61,15 @@ python <skill_path>/01_preparation/scripts/validate_profiling_env.py --device np
 
 ---
 
-## 六、精度验证脚本构建
+## 三、精度回归脚本构建
 
 **目标**：保存可信 baseline 输出，构建可一键运行的对比脚本。
 
+**Baseline 语义**：本阶段保存的是**优化前 NPU 自身输出**，回答"优化有没有退化"；Phase 0 已完成与迁移前 golden（GPU/CPU 原始实现）的对齐，回答"NPU 初始实现是否正确"。优化阶段不依赖外部 golden。
+
 ### Baseline 来源与对比策略
 
-遵循 [04_accuracy_assurance/SKILL.md](../04_accuracy_assurance/SKILL.md)：按优先级确认基线来源，按输出类型选择距离函数，阈值在比较前声明。本阶段只构建脚本框架，不定义具体方法论。
+基线来源即上文「Baseline 语义」确定的优化前 NPU 自身输出；对比方法论（按输出类型选择距离函数、阈值在比较前声明）遵循 [04_accuracy_assurance/SKILL.md](../04_accuracy_assurance/SKILL.md)。本阶段只构建脚本框架，不定义具体方法论。
 
 ### 输出保存
 

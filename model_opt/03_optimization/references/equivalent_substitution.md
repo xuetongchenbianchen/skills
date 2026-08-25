@@ -60,7 +60,7 @@
 
 ### 等价性验证
 
-每次替换后必须验证等价性——替换是改实现不改语义，语义不变是铁约束。验证方法见 [equivalence_verification.md](../../04_accuracy_assurance/references/equivalence_verification.md)。
+每次替换后必须验证等价性——替换是改实现不改语义，语义不变是铁约束。验证方法见 [equivalence_verification.md](equivalence_verification.md)。
 
 ### NPU 浮点非结合律
 

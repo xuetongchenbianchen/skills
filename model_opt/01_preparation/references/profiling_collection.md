@@ -16,12 +16,12 @@
 
 ## 采集规则
 
-1. **环境变量**：必须在 `import torch_npu` 前设置 `TASK_QUEUE_ENABLE=2`（异步流水）和 `CPU_AFFINITY_CONF=1`（CPU 绑核）
+1. **环境变量**：必须在 `import torch_npu` 前设置 `TASK_QUEUE_ENABLE=2`（异步流水）和 `CPU_AFFINITY_CONF=1`（CPU 绑核）；完整性能环境变量清单（LD_PRELOAD、内存池策略、多卡 HCCL 等）见 [00 环境参考](../../00_adaptation/references/environment_reference.md)
 2. **输出路径**：`<workspace>/profiling/<YYYYMMDD_HHMMSS>/`，禁止 `/tmp` 或无时间戳路径；每次更新 `profiling/latest` 软链接
 3. **禁止 `export_chrome_trace`**：只产出 trace.json，不产出 `step_trace_time.csv`，无法做 L0/L1 交叉验证和下界分析。必须用 `tensorboard_trace_handler`
 4. **采集与业务分离**：业务推理逻辑封装为函数（如 `run_inference(model, input_data)`），采集脚本只包围这个函数。优化改函数内部，采集脚本不改
 5. **warmup**：推理场景采集前手动预热 3 次（触发编译/缓存），不使用 schedule；训练场景用 `schedule(skip_first=20)` 替代
-6. **输入数据**：L1 采集使用 Phase 1 选定的 1 条生产中位样本（见 [SKILL.md](../SKILL.md) 第四节）；wall-clock 和 L0 在性能测试集上跨 shape 采集。下方模板中的 `input_data` 对应当前测量的输入
+6. **输入数据**：L1 采集使用 Phase 1 选定的 1 条生产主流 regime 代表样本（见 [SKILL.md](../SKILL.md) 第一节）；wall-clock 和 L0 在性能数据（全部 regime 代表）上采集，同一条输入重复 ≥20 次取中位数。下方模板中的 `input_data` 对应当前测量的输入
 
 ## wall-clock benchmark 模板
 
@@ -116,6 +116,16 @@ with torch_npu.profiler.profile(
 - **PyTorch Lightning**：`on_train_start` 启动 profiler，`on_train_batch_end` 调 `prof.step()`，`on_train_end` 停止
 - **HuggingFace Trainer**：`on_train_begin` 启动，`on_step_end` 调 `prof.step()`，`on_train_end` 停止
 - **DeepSpeed 多卡**：每张卡独立采集，写入 `rank_<n>/` 子目录（`run_analysis.py --rank N` 定位）。只要涉及通信瓶颈分析就必须全卡采集
+
+## 多卡并行推理采集（切分模型回归 Phase 1 时）
+
+多卡切分模型（[07_parallel_splitting](../../07_parallel_splitting/SKILL.md) 验证通过后回归主线）**完全按上述主流程采集**，唯一的区别是采集脚本以多进程方式启动，带来两个必然后果：
+
+- **启动**：`python script.py` → `torchrun --nproc_per_node=N script.py`
+- **输出路径**：N 个进程执行同一脚本，输出目录须按 rank 区分——`profiling/<timestamp>/rank_<n>/`（profiler 参数与路径规范本身不变）
+- **wall-clock**：各 rank 独立计时，端到端时间取 max（最慢 rank 决定整体）
+
+推荐直接覆写 Phase 1 单卡脚本（保留 git 历史），切分接入的 `disable_parallel()` 可还原单卡行为。多卡目录无需特殊处理——`run_analysis.py` 自动检测 `rank_N` 子目录进入跨 Rank 对比（通信数据需 L1 采集，L0 无 communication.json）。
 
 ## GPU 对比采集
 

@@ -42,14 +42,15 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
 | [npu_checklist.md](references/npu_checklist.md) | 始终加载 | NPU 已知性能陷阱的 grep 扫描清单 |
 | [npu_operator_catalog.yaml](references/npu_operator_catalog.yaml) | 替换维度层 1 时加载 | 融合算子目录（被 equivalent_substitution.md 引用） |
 | [compilation_tools.md](references/compilation_tools.md) | host-bound 时 | TorchScript/jit.trace/torch.compile(npu)/NPU JIT 的选择决策树、兼容性排查、编译粒度决策 |
-| [parallel_design.md](references/parallel_design.md) | 多卡并行场景 | 切分维度选择、通信原语选型、并行区域设计 |
+
+> 多卡切分方案设计不在本子技能（属 [07_parallel_splitting](../07_parallel_splitting/SKILL.md)，Phase 0 分诊触发的条件轨道）；已多卡场景的通信优化按四维度框架走——通信-计算重叠见 [hide_latency.md](references/hide_latency.md)（掩盖），瓶颈类型判定见 [profiling_to_action.md](../02_bottleneck_analysis/references/profiling_to_action.md) 归因层 #8。
 
 ## 通用原则
 
 - 每次优化后重新 Profiling，确认瓶颈是否转移
 - GPU 最优实践在 NPU 可能反效果，必须实测验证
 - 保留原始实现供 fallback
-- 权重修改须保持 checkpoint 可加载且数值等价：默认保持 state_dict key/结构不变；当结构性融合必须改变结构时，须提供与模型同处的确定性重映射函数并通过等价性验证（详见 [reuse_and_precompute.md](references/reuse_and_precompute.md)「Checkpoint 兼容性」）
+- 权重修改须保持 checkpoint 可加载且数值等价（原则见主 SKILL「核心原则 · checkpoint 兼容」，操作细节见 [reuse_and_precompute.md](references/reuse_and_precompute.md)「Checkpoint 兼容性」）
 - 优化尝试失败也要记录（what + why + 实际效果），避免重复踩坑
 - **四维度逻辑正交 + NPU 硬件耦合**：四个维度（去重/复用/掩盖/替换）在逻辑层面正交——它们各自回答不同的优化问题（见上表）。但在 NPU 上，维度间通过**内存分配模式**和**异步流水线**（`TASK_QUEUE_ENABLE=2`）产生硬件耦合：任何改变操作数量或操作顺序的优化（去重/替换），都可能改变 NPU 异步流水线的重叠模式，导致预期外的性能回退。
   - "一个方向的逻辑失败不影响其他方向"——逻辑层面仍然成立，不要因一个替换方案失败就放弃独立的去重方案
