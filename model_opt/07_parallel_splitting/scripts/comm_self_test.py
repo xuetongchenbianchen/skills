@@ -102,7 +102,7 @@ def self_test():
     output_list = [torch.empty_like(t) for _ in range(ws)]
     all_to_all(output_list, input_list)
     check("all_to_all",
-          all(output_list[i][0].item() == float(rank) for i in range(ws)))
+          all(output_list[i][0].item() == float(i) for i in range(ws)))
 
     # 10. 便捷函数: allgather_along_dim + local_chunk 往返
     full = torch.arange(ws * 4, dtype=torch.float, device=device)
@@ -112,7 +112,12 @@ def self_test():
     check("allgather/local_chunk roundtrip", torch.equal(full, recovered))
 
     # 11. 便捷函数: row_to_col / col_to_row 往返
-    t = torch.full((4, ws * 2, 3), float(rank), device=device)
+    # 往返恒等要求各 rank 输入张量一致（row_to_col 后各块来自各 rank）
+    t = torch.zeros(4, ws * 2, 3, device=device)
+    if rank == 0:
+        t = torch.arange(4 * ws * 2 * 3, dtype=torch.float,
+                         device=device).view(4, ws * 2, 3)
+    broadcast(t, src=0)
     swapped = row_to_col(t)
     back = col_to_row(swapped)
     check("row_to_col/col_to_row roundtrip", torch.allclose(t, back, atol=1e-6))

@@ -84,6 +84,9 @@
     known_pitfalls:
       - pitfall: <string>
         mitigation: <string>
+    numeric_sensitivity: <string, optional>
+      # 数值敏感性评估结论（评测/RL 等敏感场景的验收策略与容差档选择，
+      # 见 07 implementation_guide「验收标准」）
     rollback: <string>  # 恢复机制，如 disable_parallel() / git revert
 
   optimization:

@@ -122,9 +122,12 @@ def parse(profiling_dir: str, rank=None, top_k: int = 30) -> str:
     top3_us = sum(r["_total_us"] for r in rows_sorted[:3])
     top3_ratio = top3_us / total_us * 100 if total_us > 0 else 0
     top3_names = [f"{r.get('OP Type', '?')} {r['_total_us']/total_us*100:.0f}%" for r in rows_sorted[:3]] if total_us > 0 else []
-    lines.append(f"- [DEFINITE] Top-3 集中度: {top3_ratio:.1f}% ({', '.join(top3_names)})")
-    if top3_ratio > threshold("op_statistic", "top3_concentration", 80):
+    top3_threshold = threshold("op_statistic", "top3_concentration", 80)
+    if top3_ratio > top3_threshold:
+        lines.append(f"- [DEFINITE] Top-3 集中度: {top3_ratio:.1f}% > {top3_threshold}% ({', '.join(top3_names)})")
         lines.append(f"  - 瓶颈高度集中 — 优化 top 算子的杠杆效应显著")
+    else:
+        lines.append(f"- [INFO] Top-3 集中度: {top3_ratio:.1f}% ({', '.join(top3_names)})")
 
     # 2. AI_CPU fallback（非通信算子在 AI_CPU 上执行）
     if aicpu_non_comm:

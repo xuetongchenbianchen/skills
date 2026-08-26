@@ -19,6 +19,9 @@ THRESHOLDS = {
         "step_util_variance": 20,           # % — max-min util difference across steps
         "step_duration_spread": 2.0,        # max/min ratio for step duration outlier
         "large_optimizable_space": 30,      # % — Free/Total above this = large optimizable space
+        "comm_overlap_excellent": 80,       # % — overlapped/comm above this = excellent overlap
+        "comm_overlap_moderate": 50,        # % — overlapped/comm above this = moderate overlap
+        "pipeline_effective_low": 70,       # % — pipeline effective ratio below this = low (bubble)
     },
 
     "op_statistic": {
@@ -32,6 +35,9 @@ THRESHOLDS = {
         "heavy_max_count": 10,              # count <= this = heavy single-invocation
         "heavy_min_avg_us": 100,            # us — avg above this = heavy
         "heavy_min_ratio": 0.01,            # total/total ratio above this = heavy
+        "variance_max_avg_ratio": 5.0,      # x — max/avg per-op duration above this = variance signal
+        "variance_min_total_ratio": 0.01,   # op total share below this = skip variance signal
+        "frag_min_total_ratio": 0.01,       # fragmentation op total share below this = skip signal
     },
 
     "kernel_details": {
@@ -55,6 +61,7 @@ THRESHOLDS = {
         "non_nd_format_ratio": 0.1,        # ratio — non-ND input format above this = layout conversion signal
         "filter_high_wait_multiplier": 3,  # x — wait > avg * this in filter mode = high-wait instance
         "filter_high_wait_min_us": 200,    # us — minimum wait for filter mode high-wait context
+        "fp32_ratio_signal": 0.5,          # ratio — fp32 kernel duration share above this = SIGNAL
     },
 
     "trace_view": {

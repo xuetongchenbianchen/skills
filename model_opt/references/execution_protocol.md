@@ -60,10 +60,10 @@ Line B（profiling 分析）的产出必须包含以下内容，且其中的发�
    - 若 L0 不可用，标注"L1 未交叉验证"后方可继续，但后续判断须谨慎
 
 2. **根因追踪记录**（见 [02_bottleneck_analysis/SKILL.md](../02_bottleneck_analysis/SKILL.md) Line B 流程 step 3 + [profiling_to_action.md](../02_bottleneck_analysis/references/profiling_to_action.md)）：
-   - `run_analysis.py` 报告中所有 DEFINITE 信号和 WARNING 警告必须有对应的根因追踪记录
+   - `run_analysis.py` 报告中所有 [DEFINITE] 和 [SIGNAL] 信号必须有对应的根因追踪记录
    - 追踪产出格式：`发现来源 | 发现内容 | 使用的桥梁 | 源码位置 | 根因 | 候选方案`
    - Call Stack 断桥（"(no stack)"）的信号，桥梁列标注"断桥 → Line A 穿透框架层"，按 Line A 方法论追溯 codegen 生成路径
-   - 所有 DEFINITE/WARNING 的追踪未完成 = 不得填写优先级覆盖表
+   - 所有 [DEFINITE]/[SIGNAL] 的追踪未完成 = 不得填写优先级覆盖表
 
 3. **候选清单**（见 [profiling_to_action.md](../02_bottleneck_analysis/references/profiling_to_action.md) §候选评估：反事实收益上限）：
    - 每条候选含：问题 + 位置 + 影响范围 + 反事实收益上限（引用报告输出数值）

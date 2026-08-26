@@ -28,6 +28,17 @@ def main() -> int:
     else:
         emit("PASS", "output-dir", f"父路径存在: {parent}")
 
+    # 采集强制环境变量（采集脚本须在 import torch_npu 之前设置）
+    for var, expected in (("TASK_QUEUE_ENABLE", "2"), ("CPU_AFFINITY_CONF", "1")):
+        value = os.environ.get(var)
+        if value != expected:
+            emit("FAIL", var,
+                 f"未设置或不为 {expected}（当前: {value!r}）— "
+                 f"采集脚本须在 import torch_npu 前 export {var}={expected}")
+            failures += 1
+        else:
+            emit("PASS", var, f"={value}")
+
     try:
         import torch
         import torch_npu

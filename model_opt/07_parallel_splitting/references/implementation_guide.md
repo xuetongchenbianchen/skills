@@ -93,7 +93,9 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 2. 填写 4 个函数：`build_model` / `build_sample` / `run_inference` / `enable_parallel`
 3. 切分前：`python verify_split.py --mode baseline --split-type <order_preserved|order_changed>`
 4. 切分后：`torchrun --nproc_per_node=N verify_split.py --mode verify --split-type <同上>`
-5. 检查 `verify_report.json` 中 `overall=true` 才算通过
+5. 检查 `verify_report.json` 中 `overall=true` 才算通过（报告路径可用 `--report` 改名；基线目录默认 `./verify_baseline`，可用 `--baseline-dir` 指定）
+
+> `--split-type` 必须显式指定——脚本默认 order_changed 宽松档，不指定会静默落入 1e-3 容差。
 
 **核心原则**：tolerance 是通过门禁，bit-exact 仅 debug 工具。
 
@@ -105,12 +107,12 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 
 ### 验收标准
 
-> 理论依据：浮点加法不满足结合律，切分改变归约顺序导致数值差异（BF16 典型误差 10⁻⁵ 级）。切可切维（如 batch）不改变归约顺序→误差极低；切归约维（如权重输出维、归约维）改变聚合顺序→误差增大。见 [analysis_workflow.md](analysis_workflow.md) 第三步「等价性论证」。
+> 理论依据：浮点加法不满足结合律，切分改变归约顺序导致数值差异（BF16 典型误差 10⁻⁵ 级）。切可切维（如 batch）不改变归约顺序→误差极低；切归约维（如权重输入维、softmax 的 seq 维）改变聚合顺序→误差增大。切权重/切专家无论精度一律按 order_changed 分档（脚本保守分类）。注意对比对象是同一样本在单卡/多卡的输出：不切归约维时两次计算相同，与 dtype 无关。见 [analysis_workflow.md](analysis_workflow.md) 第三步「等价性论证」。
 
 | 切分影响 | 精度风险 | 验收 |
 |---------|---------|------|
-| 不改变计算顺序（切 batch / fp32 切 seq / 切层） | 极低 | allclose(atol=1e-6) |
-| 改变累加顺序/聚合方式（bf16 切 seq / 切权重 / 切专家） | 中 | allclose(atol=1e-3) |
+| 不切归约维（切 batch / 切层），或切归约维但 fp32 且误差可忽略（fp32 切 seq，误差 ~1e-7 级） | 极低 | allclose(atol=1e-6, rtol=1e-5) |
+| 切归约维且精度敏感（bf16 切 seq / 切权重（不分精度，脚本保守分类）/ 切专家） | 中（1e-5 级起步，长归约可达 1e-3） | allclose(atol=1e-3, rtol=1e-3) |
 
 > 具体容差应根据模型精度要求和数值范围调整。若模型用于评测或 RL（对数值一致性敏感），需收紧容差或固定归约顺序。
 
@@ -121,6 +123,8 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 | 1 冒烟 | 最小输入跑通 + shape 断言 | 逻辑不报错 |
 | 2a | 最小输入单卡 vs 多卡 tolerance | 快速定位逻辑错误 |
 | 2b | 真实规模多配置 tolerance | 最终通过标准 |
+
+> 模板脚本 `verify_split.py` 将 Tier 1 冒烟与 2a 合并为一条记录（`Tier1-smoke+2a`），分层强制语义不变（前一层不过不进下一层）。"真实规模"指锚点配置之外、单卡仍可跑通的最大规模——单卡放不下的配置无法产生单卡基线，其正确性由锚点配置验证 + 切分等价性论证（evidence_db `proofs`）共同背书。
 
 ### 对比方法
 
