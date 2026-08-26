@@ -5,6 +5,17 @@ description: NPU 模型适配与性能优化全流程（模型适配 → profili
 
 # NPU 模型适配优化
 
+## 运行前统一原则：NPU 资源检查
+
+**每次需要运行代码（benchmark / profiling / 精度验证 / 功能测试等）之前，必须先用 `npu-smi info` 检查 NPU 上是否有与本任务无关的进程。若存在，先确认这些进程与当前任务无关（必要时向用户确认归属），再清理进程、释放显存，确认资源干净后才开始运行。** 无关进程会争抢算力/显存，导致性能数据失真或 OOM。
+
+```bash
+npu-smi info        # 检查各卡上的进程占用
+ps -fp <PID>        # 确认进程身份与归属
+kill <PID>          # 确认无关后清理（顽固进程用 kill -9）
+npu-smi info        # 复查确认显存/算力已释放
+```
+
 ## 启动协议
 
 无论从哪个子技能进入，执行前必须：
@@ -12,7 +23,7 @@ description: NPU 模型适配与性能优化全流程（模型适配 → profili
 1. 确认当前在哪个 Phase（参见下方「全流程」）
 2. 确认上一个 Phase 的产出已完成
 3. 按全流程顺序执行，不跳步
-4. 进入每个phase后，所有reference文件需要按需加载，确认已读/跳过状态，并在 evidence_db 中记录
+4. 进入每个phase后，所有reference文件需要按需加载，确认已读/跳过状态，并在 evidence_db 案例的 `analysis_path.steps` 中留痕
 
 ## 核心原则
 

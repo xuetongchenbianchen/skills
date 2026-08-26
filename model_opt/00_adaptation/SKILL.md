@@ -5,6 +5,17 @@ description: NPU 模型适配（model_opt Phase 0）：环境检测与隔离 →
 
 # NPU 模型适配（Phase 0）
 
+## 运行前统一原则：NPU 资源检查
+
+**每次需要运行代码（benchmark / profiling / 精度验证 / 功能测试等）之前，必须先用 `npu-smi info` 检查 NPU 上是否有与本任务无关的进程。若存在，先确认这些进程与当前任务无关（必要时向用户确认归属），再清理进程、释放显存，确认资源干净后才开始运行。** 无关进程会争抢算力/显存，导致性能数据失真或 OOM。
+
+```bash
+npu-smi info        # 检查各卡上的进程占用
+ps -fp <PID>        # 确认进程身份与归属
+kill <PID>          # 确认无关后清理（顽固进程用 kill -9）
+npu-smi info        # 复查确认显存/算力已释放
+```
+
 ## 核心原则
 
 - **原始文档为准**：推理配置必须来自模型 config.json / README / paper，不凭经验猜测

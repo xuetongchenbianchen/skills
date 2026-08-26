@@ -5,6 +5,17 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
 
 # NPU 优化实施
 
+## 运行前统一原则：NPU 资源检查
+
+**每次需要运行代码（benchmark / profiling / 精度验证 / 功能测试等）之前，必须先用 `npu-smi info` 检查 NPU 上是否有与本任务无关的进程。若存在，先确认这些进程与当前任务无关（必要时向用户确认归属），再清理进程、释放显存，确认资源干净后才开始运行。** 无关进程会争抢算力/显存，导致性能数据失真或 OOM。
+
+```bash
+npu-smi info        # 检查各卡上的进程占用
+ps -fp <PID>        # 确认进程身份与归属
+kill <PID>          # 确认无关后清理（顽固进程用 kill -9）
+npu-smi info        # 复查确认显存/算力已释放
+```
+
 ## 定位
 
 本阶段承接 Profiling 分析（02）的结论，将定位到的瓶颈点转化为具体的优化方案并实施。
@@ -35,11 +46,11 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
 
 ## 场景专用 Reference
 
-以下文件按场景条件加载，不强制读取：
+以下文件按场景条件加载，不强制读取（npu_checklist 除外）：
 
 | Reference | 加载条件 | 核心内容 |
 |-----------|---------|---------|
-| [npu_checklist.md](references/npu_checklist.md) | 始终加载 | NPU 已知性能陷阱的 grep 扫描清单 |
+| [npu_checklist.md](references/npu_checklist.md) | 每轮优化开始前必读 | NPU 已知性能陷阱的 grep 扫描清单 |
 | [npu_operator_catalog.yaml](references/npu_operator_catalog.yaml) | 替换维度层 1 时加载 | 融合算子目录（被 equivalent_substitution.md 引用） |
 | [compilation_tools.md](references/compilation_tools.md) | host-bound 时 | TorchScript/jit.trace/torch.compile(npu)/NPU JIT 的选择决策树、兼容性排查、编译粒度决策 |
 
@@ -57,11 +68,13 @@ description: 优化实施：用去重/复用/掩盖/替换四维度框架实施�
   - "但任何改变操作序列的优化必须用 L0 端到端 benchmark 验证"——不能只看 profiling 中的算子级数据，因为异步流水线的重叠效果只在端到端时间中体现
   - 若优化导致端到端回退但 profiling 显示算子级改善，根因是异步流水线耦合——记录此发现，可考虑通过自适应阈值（如不同输入规模用不同实现）规避
 - **深度优先于广度**：对每个优化方向，穷尽探索（多种实现、完整验证）比浅尝多个方向更有价值。如果环境支持子 agent，建议对独立的方向/算子 spawn 子 agent 逐个深挖，避免因同时处理太多方向而浅尝辄止
-- **编译工具优先尝试**：Phase 2 分析完瓶颈后，Phase 3 先用 npu_checklist 扫描并解决 D2H 同步、AI CPU 回退等编译无法覆盖的结构性问题，然后尝试编译工具（TorchScript / torch.jit.trace / torch.compile(npu)），因为编译自动消除大量框架级开销（Python 解释器、Module.__call__、属性查找），不需要手动 inline 或预提取。编译后重新 profiling，数据更准确，再用四维度解决编译无法覆盖的剩余问题。如果编译失败，用四维度出发解决兼容性问题后重试。详见 [compilation_tools.md](references/compilation_tools.md)。
+- **编译工具优先尝试（host-bound 场景优先）**：Phase 2 分析瓶颈时同步用 npu_checklist 扫描；Phase 3 先解决其发现的 D2H 同步、AI CPU 回退等编译无法覆盖的结构性问题，然后尝试编译工具（TorchScript / torch.jit.trace / torch.compile(npu)），因为编译自动消除大量框架级开销（Python 解释器、Module.__call__、属性查找），不需要手动 inline 或预提取——host-bound 时收益最大，适用性判定见 [compilation_tools.md](references/compilation_tools.md)。编译后重新 profiling，数据更准确，再用四维度解决编译无法覆盖的剩余问题。如果编译失败，用四维度出发解决兼容性问题后重试。
 
 ## 方向放弃标准（分级）
 
 放弃一个优化方向前，须满足该方向所属级别的全部条件：
+
+> 本分级（Level 1/2/3）是**难度分级**（决定放弃代价），与 04 的**验证分级**（决定验证强度）是两套体系——替换级（本体系 Level 2）改动在 Phase 3 逐条验证时须过 [equivalence_verification.md](references/equivalence_verification.md) 协议，而非仅 04 的 Level 1 快速验证。
 
 **Level 1 — 微调级**（改参数 / flag / 跳过单步操作 / 1-3 行代码改动）
 - A/B benchmark 对比（优化前 vs 优化后，同一输入，≥3 次取中位数）
