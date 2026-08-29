@@ -1,5 +1,12 @@
 # Profiling 解析脚本使用指南
 
+## 目录
+
+- [概述](#概述) / [脚本列表](#脚本列表)（11 个脚本 × 对应文件 × 用途速查）/ [通用调用方式](#通用调用方式)
+- 各脚本详细说明（按需查询单个脚本）：
+  [parse_op_statistic](#parse_op_statisticpy) / [parse_api_statistic](#parse_api_statisticpy) / [parse_step_trace](#parse_step_tracepy) / [parse_kernel_details](#parse_kernel_detailspy) / [parse_memory_record](#parse_memory_recordpy) / [parse_operator_details](#parse_operator_detailspy) / [parse_operator_memory](#parse_operator_memorypy) / [parse_trace_view](#parse_trace_viewpy) / [parse_communication](#parse_communicationpy) / [diff_profiling](#diff_profilingpy)
+- [注意事项](#注意事项)
+
 ## 概述
 
 本 skill 的 `scripts/` 目录（即 `02_bottleneck_analysis/scripts/`）下的脚本用于解析 CANN profiler 产出的 CSV 文件，将百万级原始数据压缩为结构化摘要，供 agent 消费后做优化决策。
@@ -22,6 +29,7 @@
 | `parse_communication.py` | `communication.json` + `communication_matrix.json`（+ `operator_details`/`trace_view` 溯源） | — | 多卡通信统一分析：M1 溯源、M2 Matrix 判读、M3 跨 Rank straggler 定位、M4 带宽自基准（多 rank 目录自动 `--all-ranks`） |
 | `parse_trace_view.py` | `trace_view.json` | 4MB-1GB+ | 时序：host→device 下发链、device 空隙、在线编译停顿、Call stack 源码栈 |
 | `diff_profiling.py` | 两份 profiling 目录 | — | 对比两次采集的算子耗时和内存变化 |
+| `line_a_report.py` | findings.yaml（agent 产出，非 profiling 文件） | — | Line A 报告渲染器：schema 校验（疑点须引用事实 id、三层事实非空）+ 热路径覆盖检查 + 落盘 `analysis/round_{N}/line_a_report.md`（详见 [proactive_source_analysis.md](proactive_source_analysis.md)「报告落盘」） |
 
 ## 通用调用方式
 

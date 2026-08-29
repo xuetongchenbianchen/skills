@@ -1,5 +1,11 @@
 # 实施与验证指南
 
+## 目录
+
+- [实施主线路径](#实施主线路径) / [切分怎么接入模型](#切分怎么接入模型) / [通信原语](#通信原语) / [权重处理](#权重处理)
+- [正确性验证](#正确性验证)——验收标准 / 验证分层 / 对比方法
+- [记录与回归](#记录与回归验证通过后) / [调试排查](#调试排查)——问题归属 / 性能问题归属
+
 > 覆盖分析通过后的实施、验证、记录回归与调试，以及回归 Phase 1 的并行 profiling 采集。分析阶段见 [analysis_workflow.md](analysis_workflow.md)。
 
 ---
@@ -10,7 +16,7 @@
 
 1. **接入决策**：选择替换机制——monkey-patch / 子类覆写 / 源码内嵌（→「切分怎么接入模型」）
 2. **通信基建**：copy 基座 `comm_primitives.py`，按张量分布约定表从 `comm_recipes.py` 取用组合函数（→「通信原语」）
-3. **实现切分**：按分析的 `tensor_distribution_table` 逐模块实现并行 forward，权重按分布表切片加载（→「切分怎么接入模型」「权重处理」）
+3. **实现切分**：按落盘的张量分布约定表逐模块实现并行 forward，权重按分布表切片加载（→「切分怎么接入模型」「权重处理」）
 4. **启动冒烟**：`torchrun --nproc_per_node=N` 启动——先 source CANN 环境脚本（见 [00 环境参考](../../00_adaptation/references/environment_reference.md)，含环境变量清单），`ASCEND_RT_VISIBLE_DEVICES` 与 `--nproc_per_node` 一致；最小输入跑通 + shape 断言（冒烟即验证 Tier 1）
 5. **分层验证**：verify_split.py 单卡 vs 多卡（→「正确性验证」）
 
@@ -24,12 +30,16 @@
 | 子类覆写 | 并行逻辑与原逻辑差异大 | 换类 |
 | 源码内嵌 | 长期核心需求 | git revert；需保证 `is_parallel()=False` 时行为不变 |
 
-**接入约定**（项目侧自行实现，`verify_split.py` 与 evidence_db 按此对接）：patch 怎么写是通用 Python 能力，不在此展开；需要遵守的是三条契约——
+**接入约定**（项目侧自行实现，`verify_split.py` 的 `enable_parallel` 按此对接）：patch 怎么写是通用 Python 能力，不在此展开；需要遵守的是三条契约——
 1. 提供 `enable_parallel()` / `disable_parallel()` **可逆对**：patch 前保存原始 forward 引用，disable 时恢复
 2. `world_size=1` 时 enable 为 no-op（单卡兼容）
 3. 切分开关用**模块级 guard**，未切分模块不检测全局 flag（避免误触发，见「调试排查」）
 
-**全程保持切分（进入/退出决策）**：进入时每卡从完整张量取本地分片（零拷贝 slice），或 rank 0 scatter 到各卡（节省初始内存）——不假设输入已是本地分片，跨迭代场景首轮可能是全局 `[N, ...]`、后续轮已是本地 `[N/P, ...]`，用 shape 显式判断（`shape[0] == N`）后取片。退出时尽量不退——下游模块能在切分数据上运行就继续传递本地分片；个别操作必须用全局数据（如需要完整二维索引的 gather）时临时 AllGather、用完立即释放；仅在最终输出时 AllGather 回全量。避免在中间重建 GB 级全局张量。
+**全程保持切分**——进入 / 中途 / 退出三条规则：
+
+- **进入**：每卡从完整张量取本地分片（零拷贝 slice），或 rank 0 scatter 到各卡（节省初始内存）。不假设输入已是本地分片——跨迭代场景首轮可能是全局 `[N, ...]`、后续轮已是本地 `[N/P, ...]`，用 shape 显式判断（`shape[0] == N`）后取片
+- **中途**：尽量不退——下游模块能在切分数据上运行就继续传递本地分片；个别操作必须用全局数据（如需要完整二维索引的 gather）时临时 AllGather、用完立即释放
+- **退出**：仅在最终输出时 AllGather 回全量。避免在中间重建 GB 级全局张量
 
 ---
 
@@ -55,15 +65,19 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 
 ## 权重处理
 
-切分后，被切维度上的权重需要按 rank 取对应分片，未被切的权重在各 rank 间复制。具体哪些权重需要切、沿哪个维度切，由 `tensor_distribution_table` 决定。
+切分后，被切维度上的权重需要按 rank 取对应分片，未被切的权重在各 rank 间复制。具体哪些权重需要切、沿哪个维度切，由方案确认时落盘的张量分布约定表（`tensor_distribution.md`）决定。
 
-**原则**：逐权重对照 `tensor_distribution_table` —— 在切分维度上的权重按 `rank` 取切片，不在切分维度上的权重整份加载。合并存储的权重需按合并方式确定 slice 顺序。加载后遍历子模块触发后处理（量化 scale 调整等）。
+**原则**——逐权重对照 `tensor_distribution_table`：
+- 在切分维度上的权重按 `rank` 取切片，不在切分维度上的权重整份加载
+- 合并存储的权重需按合并方式确定 slice 顺序
+- 加载后遍历子模块触发后处理（量化 scale 调整等）
 
-**在线切分**（推荐）：各 rank 读同一份完整 checkpoint，按 `rank` 自动加载切片。在每个并行模块中实现 `weight_loader()`。
+| 方式 | 做法 | 代价 |
+|------|------|------|
+| 在线切分（推荐） | 各 rank 读同一份完整 checkpoint，按 `rank` 自动加载切片（并行模块实现 `weight_loader()`） | 每次启动重复切片计算 |
+| 离线转换（备选） | 预切权重输出 `rank_0/` ~ `rank_N/` 目录 | 与切分配置绑定，改策略或 world_size 需重新转换 |
 
-**离线转换**（备选）：预切权重输出为 `rank_0/` ~ `rank_N/` 目录。与切分配置绑定，改策略或 world_size 需重新转换。
-
-> 切分维度、切片大小必须与 evidence_db 中 `parallel_splitting.tensor_distribution_table` 一致。
+> 切分维度、切片大小必须与落盘的张量分布约定表一致；该表格式同 evidence_db `parallel_splitting.tensor_distribution_table`，最终入库时直接复制。
 
 ---
 
@@ -71,7 +85,7 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 
 > 方案的数学等价性在分析阶段论证（★ 方案确认）；本节验证实施正确性与浮点容差，不可跳过。
 
-> **切分只验切分（耗时边界）**：本节验证回答且仅回答"切分实施是否正确"——张量分布是否符合约定表、通信原语是否配对、浮点容差是否在档。**不承担全量精度回归**（多样本、多 shape、top-1 一致性等）——那是切分通过、回归主流程后 Phase 4（04_accuracy_assurance）的职责。样本纪律：固定 **1 条代表性真实样本 + 1 条最小冒烟输入**，代表性样本覆盖被切维度的敏感特征（切 batch/含 padding → padding 边界；切 seq → 生产代表性长度；切权重 → 任一常规样本），规模取生产主流 regime 的中位代表——切分 bug 靠维覆盖暴露，不靠样本数量。
+> **切分只验切分（耗时边界）**：本节验证回答且仅回答"切分实施是否正确"——张量分布是否符合约定表、通信原语是否配对、浮点容差是否在档。**不承担全量精度回归**（多样本、多 shape、top-1 一致性等）——那是切分通过、回归 Phase 0「0.5 精度验证」（golden 对齐）的职责；Phase 4 门禁服务其后的优化循环，与切分验证无关。样本纪律（唯一定义处）：固定 **1 条代表性真实样本 + 1 条最小冒烟输入**，代表性样本覆盖被切维度的敏感特征（切 batch/含 padding → padding 边界；切 seq → 生产代表性长度；切权重 → 任一常规样本），规模取生产主流 regime 的中位代表（仅当生产负载本身即最大规模时才取最大）——切分 bug 靠维覆盖暴露，不靠样本数量。
 
 > ★ 验证必须基于模板脚本 [scripts/verify_split.py](../scripts/verify_split.py)：agent 填写 `build_model` / `build_sample` / `run_inference` / `enable_parallel` 四个函数，禁止重写比较框架（`compare_outputs` / `bit_exact_diff` / 分层逻辑）。防作弊设计见脚本头部注释。
 
@@ -80,8 +94,7 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 | 超限原因 | baseline 替代方案 | 验证的是什么 |
 |---------|-----------------|------------|
 | 激活/持久状态主导 | 缩小输入，单卡与多卡跑相同小输入 | 同一模型同一输入下的切分正确性 |
-| 权重本身超单卡 | 缩小模型（减层/减宽、保持同一切分逻辑），单卡与多卡跑同缩配版 | 切分逻辑正确性 |
-| 权重本身超单卡 | 逐层对比：单层加载完整权重比中间量 | 每层切分实施正确性 |
+| 权重本身超单卡 | ① 缩小模型（减层/减宽、保持同一切分逻辑），单卡与多卡跑同缩配版 ② 逐层对比：单层加载完整权重比中间量 | ① 切分逻辑正确性 ② 每层切分实施正确性 |
 | （辅证） | 多配置互证：P=2 与 P=4 对比 | 随 P 变化的 bug（不作主证） |
 
 缩配 baseline 在 `build_model` 中参数化缩小配置，验证记录注明缩配参数。
@@ -122,7 +135,7 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 | 2a | 最小输入单卡 vs 多卡 tolerance | 快速定位逻辑错误 |
 | 2b | 单条代表性真实样本 tolerance | 最终通过标准 |
 
-> 模板脚本 `verify_split.py` 将 Tier 1 冒烟与 2a 合并为一条记录（`Tier1-smoke+2a`），分层强制语义不变（前一层不过不进下一层）。"真实规模"取生产主流 regime 的代表样本（通常中位；仅当生产负载本身即最大规模时才取最大）——不为"测得全"而追加样本。单卡放不下的配置无法产生单卡基线，其正确性由锚点配置验证 + 切分等价性论证（evidence_db `proofs`）共同背书。
+> 模板脚本 `verify_split.py` 将 Tier 1 冒烟与 2a 合并为一条记录（`Tier1-smoke+2a`），分层强制语义不变（前一层不过不进下一层）；样本选择按上方「样本纪律」执行。单卡放不下的配置无法产生单卡基线，其正确性由锚点配置验证 + 切分等价性论证（evidence_db `proofs`）共同背书。
 
 ### 对比方法
 

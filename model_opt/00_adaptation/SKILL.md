@@ -70,6 +70,16 @@ config.json / preprocessor_config.json  (最权威)
 
 优先使用官方封装 (`AutoImageProcessor`, `AutoTokenizer`, `Pipeline`)。手动实现时逐项交叉验证。
 
+**设备适配写法**（最小改动原则的落地）：
+
+1. **import 顺序**：先设环境变量（`TASK_QUEUE_ENABLE=2` 等，完整清单见 [environment_reference.md](references/environment_reference.md) §3），再 `import torch_npu`
+2. **设备指定**：`torch.device("npu")`（或 `"npu:0"`）；可见卡由 `ASCEND_RT_VISIBLE_DEVICES` 控制
+3. **CUDA 代码迁移**，两种方式选一：
+   - 零改动：`import torch_npu` 后调用 `transfer_to_npu()`，`.cuda()` / `"cuda"` 自动映射到 NPU——适用于不改业务代码的场景（Phase 1 采集规范即基于此）
+   - 手动替换：device 字符串 `"cuda"` → `"npu"`、`.cuda()` → `.npu()`、`torch.cuda.*` → `torch.npu.*`，逐处确认，禁止盲替换后不检查
+4. **模型加载显式传 dtype**：`from_pretrained(..., dtype=...)`——不带 dtype 默认按 fp32 加载
+5. 首次运行新 shape 触发在线编译、耗时长属正常现象，第二次即恢复
+
 **禁止**：不查文档凭经验设参数、随意减步数、忽略 dtype。
 
 ### 0.4 冒烟测试与 OOM 分诊
@@ -128,6 +138,8 @@ with open(f"golden/{sample_id}_meta.json", "w") as f:
 数值对齐工具（适用于确定性+连续值策略）→ [scripts/compare_baseline.py](scripts/compare_baseline.py)（对比在 CPU 上进行，golden 与采集设备无关）
 
 其余的暂时先自行判断
+
+如果失败，回退到 0.3 推理实现，检查实现的问题
 
 **决策逻辑**：先判断模型输出属于哪一类，再选对应策略。不要对所有模型套同一套验证方法。
 

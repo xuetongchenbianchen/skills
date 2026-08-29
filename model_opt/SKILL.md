@@ -23,7 +23,7 @@ npu-smi info        # 复查确认显存/算力已释放
 1. 确认当前在哪个 Phase（参见下方「全流程」）
 2. 确认上一个 Phase 的产出已完成
 3. 按全流程顺序执行，不跳步
-4. 进入每个phase后，所有reference文件需要按需加载，确认已读/跳过状态，并在 evidence_db 案例的 `analysis_path.steps` 中留痕
+4. 进入每个phase后，所有reference文件需要按需加载，确认已读/跳过状态，并在 evidence_db 中记录
 
 ## 核心原则
 
@@ -55,11 +55,12 @@ Phase 1  基线准备
 ┌─────────────────── 一个「优化阶段」（可迭代多轮）───────────────────┐
 │ Phase 2  瓶颈分析                                                  │
 │          ├─ Line B: Profiling 分析（采集 L1 → 脚本 → 定位可见瓶颈） │
-│          └─ Line A: 源码分析（必做,四维度审视源码,发现结构性冗余）    │
-│    ↓                                                              │
-│  ★ A  用户确认优化方案（展示方案 → 确认/裁剪）                       │
-│    ↓                                                              │
-│ Phase 3  优化实施（每条改动后 Level 1 快速精度验证）                 │
+│          └─ Line A: 源码分析（必做,三层事实+判据推导疑点,报告落盘）    │
+│    ↓   合并分析 → candidates.md（问题点清单）                        │
+│ Phase 3  优化实施                                                  │
+│          ├─ 方案设计：对照每个问题点给方案或"无方案解释"（solutions.md）│
+│  ★ A  用户确认方案（问题点→方案对照 → 确认/裁剪）                    │
+│          └─ 逐条实施确认的方案（每条后 Level 1 快速精度验证）         │
 │    ↓                                                              │
 │ Phase 4  门禁验证                                                  │
 │          ├─ ① 全量精度验证（Level 2）                              │
@@ -84,10 +85,10 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 ## 执行协议（agent 程序约束）
 
-三个用户确认节点控制迭代流程，详细门禁（优先级覆盖表、Line A 完整性门禁、提交/继续审核）详见 [execution_protocol.md](references/execution_protocol.md)：
+三个用户确认节点控制迭代流程，详细门禁（candidates.md 完整性、提交/继续审核）详见 [execution_protocol.md](references/execution_protocol.md)：
 
-- **★A 方案审核**（Phase 2→3）：展示候选清单（按反事实收益上限降序），须完成优先级覆盖门禁 + Line A 完整性门禁。仅实施用户确认的条目。
-- **★B 提交审核**（Phase 4→5）：展示本批总结（性能+精度），evidence_db 已记录才允许 git commit。
+- **★A 方案审核**（Phase 3 内：方案设计 → 实施之间）：Phase 2 产出问题点清单（candidates.md），Phase 3 对照**每个问题点**设计方案（无方案的须解释）并落盘 solutions.md，经用户确认后逐条实施。前置：candidates.md 完整（信号追踪与疑点去向闭环）。
+- **★B 提交审核**（Phase 4→5）：对照 ★A 确认的方案清单逐条交代实施结果（已实施/已放弃/已回退，附效果与原因），evidence_db 已记录才允许 git commit。
 - **★C 继续确认**（Phase 5 后）：展示本轮总结 + 剩余瓶颈，询问是否开启下一轮。
 
 ## 子技能索引
@@ -99,7 +100,7 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 | Phase 2 | [02_bottleneck_analysis/SKILL.md](02_bottleneck_analysis/SKILL.md) | 瓶颈分析:源码结构线 + Profiling 数据线 |
 | Phase 3 | [03_optimization/SKILL.md](03_optimization/SKILL.md) | 实施具体优化手段 |
 | Phase 4 | [04_accuracy_assurance/SKILL.md](04_accuracy_assurance/SKILL.md) | 验证精度、调试精度问题 |
-| Phase 5 | [05_engineering/SKILL.md](05_engineering/SKILL.md) | 代码管理、日志、版本控制 |
+| Phase 5 | [05_engineering/SKILL.md](05_engineering/SKILL.md) | Git 分支与提交纪律、性能数据校验、文档维护 |
 | 案例库 | [06_evidence_db/schema.md](06_evidence_db/schema.md) | 优化案例的记录格式(schema 定义；案例数据存在项目工作目录 `evidence_db/` 下) |
 | 并行切分 | [07_parallel_splitting/SKILL.md](07_parallel_splitting/SKILL.md) | Phase 0 冒烟分诊或用户报告显存不足/需要多卡时触发（条件轨道，非顺序阶段；与主流程的 handoff 见 00 与 07 各自的流程位置说明） |
 
@@ -109,14 +110,9 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 **Phase 1 基线准备**：准备测试数据、构建 profiling 采集脚本和精度回归脚本（对齐优化前 NPU 输出；迁移前 golden 对齐已在 Phase 0 完成）。关键产出：可复现的**基线性能数据（L0 + wall-clock，全程仅一次，作为后续每轮收益判定的固定基准）** + 可一键运行的验证脚本。
 
-**Phase 2 瓶颈分析**：
-- **新轮次强制重置**：每轮 Phase 2 必须从零开始——重新采集 L1、重新运行分析脚本、重新估算下界。上一轮的分析结论/未实施方案/优化方向全部失效（性能 profile 已变）。
-- **下界分析（先做）**：估算优化空间——读取 L0 Computing 和 L0 Free，判断是否还有空间、还有多少。详见 [bound_analysis.md](references/bound_analysis.md)。
-- **Line B**:采集 **L1**,跑脚本,用两种分析模式定位可见瓶颈。
-- **Line A (必做)**:通读源码(穿透框架),用四维度审视,发现结构性冗余。用 Line B 的数据量化收益。
-- 两条线**都必须执行**,产出合并后进入**确认节点 A**（门禁详见 [execution_protocol.md](references/execution_protocol.md)）。
+**Phase 2 瓶颈分析**：新轮次强制重置——每轮重新采集 L1、重新分析，禁止沿用上轮结论（性能 profile 已变）。开局做下界分析路由重心（Free 侧 / Computing 侧），双线并行分析（Line A 源码线 + Line B profiling 线，各 spawn 一个 subagent）→ 合并产出 `candidates.md` 问题点清单。详见 [02_bottleneck_analysis/SKILL.md](02_bottleneck_analysis/SKILL.md)。
 
-**Phase 3 优化实施**：根据用户确认的优化清单，用四维度（去重、复用、掩盖、替换）框架选择具体手段，每条改动后做 Level 1 快速精度验证。全部实施后须通过「Phase 3 → Phase 4 门禁」——回溯 Phase 2 全部结构化产出做闭环检查，任何未关闭条目阻止进入 Phase 4——详见 [execution_protocol.md](references/execution_protocol.md)。
+**Phase 3 优化实施**：两步走——**方案设计**：对照 candidates.md 的每个问题点，用四维度（去重、复用、掩盖、替换）框架设计具体方案（无方案的须解释原因），落盘 `analysis/round_{N}/solutions.md`，经 **★A 用户确认**；**逐条实施**确认的方案（每方案 spawn 一个 subagent 深挖，持久性要求见 03「逐条实施：subagent 深挖」），每条改动后做 Level 1 快速精度验证，实施中放弃须满足 03 的「方向放弃标准（分级）」。全部方案处理完毕即进入 Phase 4。
 
 **Phase 4 精度验证 + Profiling 确认**：本批（本轮优化阶段）所有优化完成后，**必须依次完成**：
 1. 全量精度验证（方法论见 [04_accuracy_assurance](04_accuracy_assurance/SKILL.md)）—— 与原始 baseline 对比，确认精度无退化
@@ -127,6 +123,6 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 ## 迭代退出条件
 
-由用户在确认节点 C 中决定是否继续。agent 应基于下界分析提供量化建议：满足 [bound_analysis.md](references/bound_analysis.md)「终局判断」的整体终局条件（Free 侧与 Computing 侧**同时**耗尽，或兜底条件成立）时建议停止——注意 L0 Free < 10% 只说明 host 侧到头，须继续评估 Computing 侧（碎片算子融合/去重/替换）后才可建议停止。
+由用户在确认节点 C 中决定是否继续。agent 应基于下界分析提供量化建议：**同时满足**「终局判断」三条件（端到端停滞 + 候选穷尽 + 量化等用户决策项已摆出，见 [bound_analysis.md](02_bottleneck_analysis/references/bound_analysis.md)）时才建议停止——Free 或 Computing 任一侧到下界只是瓶颈转移信号，转为路由下一轮重心，**不是停止理由**。
 
 终局判断前必须穷尽 NPU 融合算子库，不能仅看 utilization 数字下结论。

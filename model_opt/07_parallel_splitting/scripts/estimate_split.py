@@ -68,10 +68,12 @@ def load_spec(path):
       states.replicated_param_bytes          0     各 rank 复制的参数字节数（TP 下 LayerNorm 权重、
                                                   embedding/lm_head 等不被切分整份加载的部分），
                                                   显存计算中该项不除并行度；须 < states.param
-      states.state                           0     持久运行状态总字节数（KV cache 等，第一步）
+      states.state                           0     持久状态总字节数（KV cache 等，第一步）
       states.act                             ✅    峰值激活字节数（内存时间线峰值）
       states.overhead                        2e9   框架与临时缓冲开销
-      compute_ms                             —     单卡每步计算耗时（ms，Phase 1 实测 wall-clock）。
+      compute_ms                             —     单卡每步计算耗时（ms，单卡实测 wall-clock：
+                                                  Phase 1 基线或 Phase 0 冒烟/锚点实测均可，
+                                                  首次进入本技能时 Phase 1 尚未采集）。
                                                   提供后启用收益侧：报告给出估算延迟与净收益，
                                                   排序键从通信成本改为估算延迟；缺省时仅按通信
                                                   成本排序（不反映计算收益，PP 类方案会偏高）
@@ -338,7 +340,7 @@ def main():
                            f"(净收益 {1 - r['est_latency'] / d['compute_ms']:+.0%})")
     else:
         print("可行候选按通信耗时排序（spec 未提供 compute_ms，无法估算计算收益——"
-              "PP 类方案会被高估，建议从 Phase 1 实测补 compute_ms 后重跑）:")
+              "PP 类方案会被高估，建议补单卡 wall-clock 实测（冒烟/锚点即可）后重跑）:")
         key = lambda x: x[0]["comm_total"]
         extra = lambda r: f"通信 {r['comm_total'] * 1e3:.3f}ms/步"
     for rank, (r, i) in enumerate(sorted(feasible, key=key), 1):

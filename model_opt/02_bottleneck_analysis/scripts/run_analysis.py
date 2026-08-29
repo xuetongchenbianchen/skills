@@ -6,7 +6,7 @@
   2. 细节章：各 parse 脚本的完整 statistics 输出（供下钻时参考）
 
 用法:
-    python run_analysis.py <L1 profiling 目录> [--l0-dir <L0目录>] [--rank N] [--output 报告路径]
+    python run_analysis.py <L1 profiling 目录> [--l0-dir <L0目录>] [--rank N] [--round N] [--output 报告路径]
 
 报告结构:
     总章：优化空间与信号汇总
@@ -23,7 +23,7 @@
     G. CANN 运行时 (api_statistic)
     H. 通信 (communication；多 rank 目录时自动含 H7 跨 Rank 对比与溯源)
 
-默认行为: 报告自动保存到 L1 profiling 目录下的 analysis_report.txt。
+默认行为: 报告保存到 <工作目录>/analysis/round_{N}/line_b_report.md（N 由 --round 指定，默认 0；--output 可覆盖路径）。
 """
 
 import argparse
@@ -191,8 +191,10 @@ def main():
     parser.add_argument("--l0-dir", default=None,
                         help="L0 profiling 目录（用于 L0/L1 交叉验证）")
     parser.add_argument("--rank", type=int, default=None)
+    parser.add_argument("--round", type=int, default=0,
+                        help="优化轮次（用于默认输出路径 analysis/round_{N}/）")
     parser.add_argument("--output", "-o", default=None,
-                        help="报告输出路径（默认: 保存到 L1 目录下 analysis_report.txt）")
+                        help="报告输出路径（默认: analysis/round_{N}/line_b_report.md，相对当前工作目录）")
     args = parser.parse_args()
 
     l1_dir = args.profiling_dir
@@ -315,11 +317,12 @@ def main():
 
     report = "\n".join(report_parts)
 
-    # 确定输出路径
+    # 确定输出路径：默认 analysis/round_{N}/line_b_report.md（相对当前工作目录）
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = Path(l1_dir) / "analysis_report.txt"
+        output_path = Path("analysis") / f"round_{args.round}" / "line_b_report.md"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     output_path.write_text(report, encoding="utf-8")
     print(f"分析报告已保存: {output_path}")

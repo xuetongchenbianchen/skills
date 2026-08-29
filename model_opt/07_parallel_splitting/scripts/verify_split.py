@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切分正确性验证模板脚本（第七步）。
+"""切分正确性验证模板脚本（第五步）。
 
 ★ 本脚本是模板：AGENT 必须基于本脚本填写模型相关代码，禁止重写比较框架。
 ★ 防作弊设计：
@@ -10,8 +10,8 @@
   - bit-exact 自动触发：tolerance 未通过时自动定位首个差异元素
 ★ 样本纪律（耗时控制）：固定 1 条代表性真实样本 + 1 条最小冒烟输入。
   切分验证只回答"切分实施是否正确"（张量分布 / 通信 / 浮点容差），不承担
-  全量精度回归——那是切分通过、回归主流程后 Phase 4（04_accuracy_assurance）
-  的事。代表性样本的选择标准：
+  全量精度回归——切分通过后回归 Phase 0 的「0.5 精度验证」（golden 对齐）
+  承担；Phase 4 门禁服务的是其后的优化循环，与切分验证无关。代表性样本的选择标准：
   1) 覆盖被切维度的敏感特征：切 batch / 含 padding → 须含 padding 边界；
      切 seq → 生产代表性长度；切权重 → 任一常规样本即可
   2) 规模取生产主流 regime 的代表（中位），不取最大——切分 bug 靠
@@ -52,7 +52,7 @@ def build_sample(sample_id: str):
     ★ 禁止使用未设种子的随机数；如需随机，用 torch.manual_seed(42) 等固定种子。
     ★ real_1 是唯一一条代表性真实样本，按文件头「样本纪律」选择：
       覆盖被切维度的敏感特征（padding 边界 / 代表性长度），生产中位规模，
-      不取最大。禁止为"测得全"而追加样本——全量精度回归属主流程 Phase 4。
+      不取最大。禁止为"测得全"而追加样本——全量精度回归属回归后的 Phase 0「0.5 精度验证」。
     """
     raise NotImplementedError("agent 填写：确定性输入构建")
 
@@ -114,30 +114,37 @@ def compare_outputs(a, b, atol, rtol, path="root"):
             ok = ok and r
             det.extend(d)
         return ok, det
-    ok = abs(float(a) - float(b)) <= atol if _is_scalar(a) and _is_scalar(b) else a == b
+    ok = (abs(float(a) - float(b)) <= atol + rtol * abs(float(b))
+          if _is_scalar(a) and _is_scalar(b) else a == b)
     return ok, [f"{path}: {'✓' if ok else '✗'} ({a} vs {b})"]
 
-def bit_exact_diff(a, b, path="root"):
-    """tolerance 失败时，定位首个逐元素差异。返回差异描述或 None。"""
+def bit_exact_diff(a, b, atol, rtol, path="root"):
+    """tolerance 失败时，定位首个超容差元素（与 compare_outputs 同阈值）。返回差异描述或 None。"""
     a, b = _detach(a), _detach(b)
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if a.shape != b.shape:
             return f"{path}: shape {tuple(a.shape)} vs {tuple(b.shape)}"
-        mask = ~torch.isclose(a, b)
+        mask = ~torch.isclose(a, b, atol=atol, rtol=rtol)
         if not mask.any():
             return None
         idx = tuple(int(i) for i in mask.nonzero()[0])
         return f"{path}: @{idx} a={a[idx].item():.6e} b={b[idx].item():.6e}"
-    if isinstance(a, dict):
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return f"{path}: keys {set(a)} vs {set(b)}"
         for k in a:
-            r = bit_exact_diff(a[k], b[k], f"{path}.{k}")
+            r = bit_exact_diff(a[k], b[k], atol, rtol, f"{path}.{k}")
             if r:
                 return r
-    elif isinstance(a, (list, tuple)):
+    elif isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        if len(a) != len(b):
+            return f"{path}: len {len(a)} vs {len(b)}"
         for i, (x, y) in enumerate(zip(a, b)):
-            r = bit_exact_diff(x, y, f"{path}[{i}]")
+            r = bit_exact_diff(x, y, atol, rtol, f"{path}[{i}]")
             if r:
                 return r
+    elif a != b:
+        return f"{path}: 类型或值不等 ({type(a).__name__}={a} vs {type(b).__name__}={b})"
     return None
 
 # ═══════════════════════════════════════════════════════════
@@ -184,7 +191,8 @@ def _verify(baseline, threshold, baseline_dir, report_path):
             passed, details = compare_outputs(out, baseline[sid], atol, rtol)
             entry = {"tier": tier, "sample": sid, "passed": passed, "details": details}
             if not passed:
-                entry["bit_exact"] = bit_exact_diff(_detach(out), baseline[sid]) or "未定位到"
+                entry["bit_exact"] = bit_exact_diff(_detach(out), baseline[sid],
+                                                    atol, rtol) or "未定位到"
             report["tiers"].append(entry)
         else:
             passed = None
@@ -216,6 +224,7 @@ def _verify(baseline, threshold, baseline_dir, report_path):
         _write_report(report, report_path)
     print(f"[{'PASS' if overall else 'FAIL'}] "
           f"{'全部通过 ✓' if overall else '验证未通过，详见 report'}")
+    sys.exit(0 if overall else 1)
 
 def _write_report(report, path):
     p = Path(path)
@@ -229,7 +238,7 @@ def _write_report(report, path):
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser(description="切分正确性验证模板（第七步）")
+    ap = argparse.ArgumentParser(description="切分正确性验证模板（第五步）")
     ap.add_argument("--mode", choices=["baseline", "verify"], required=True)
     ap.add_argument("--split-type", choices=list(THRESHOLDS), required=True,
                     help="order_preserved=1e-6 / order_changed=1e-3（必填，防止静默落入宽松档）")
@@ -241,7 +250,7 @@ def main():
         _collect_baseline(args.baseline_dir)
     else:
         baseline = torch.load(Path(args.baseline_dir) / "baseline_outputs.pt",
-                              map_location="cpu")
+                              map_location="cpu", weights_only=False)
         _verify(baseline, threshold, args.baseline_dir, args.report)
 
 if __name__ == "__main__":

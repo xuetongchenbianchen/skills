@@ -16,5 +16,3 @@ kernel_meta/
 *.log
 .venv/
 ```
-
-**应当纳入 git** 的：源代码与脚本（`scripts/`、主目录入口）、结论性记录（`evidence_db/`、`comparison_records/` 摘要）。

@@ -12,6 +12,7 @@ Profiling 采集、精度对比等操作必须遵循统一的规范，确保每�
 ├── run_inference.py        # 推理入口（主目录）
 ├── weights/                # 模型权重与配置（不提交）
 ├── scripts/                # 模型相关脚本：精度验证、benchmark、profiling 采集等（提交）
+├── analysis/               # Phase 2 分析产物：round_{N}/ 子目录存放 Line A/Line B 报告与合并候选清单（提交）
 ├── profiling/              # profiling 采集输出（不提交）
 ├── golden/                 # 迁移前 golden 输出（Phase 0 适配精度对齐，不提交）
 ├── baseline/               # 优化前 baseline 输出（Phase 1 优化回归，不提交）
@@ -20,7 +21,7 @@ Profiling 采集、精度对比等操作必须遵循统一的规范，确保每�
 ```
 
 - git clone 下来的模型库按此结构重组：已有脚本归入 `scripts/`，权重移动或软链到 `weights/`，推理入口保持在主目录
-- 提交范围按目录决定：源代码与结论性记录（`scripts/`、`evidence_db/`、`comparison_records/`）提交；原始大体积数据（`weights/`、`profiling/`、`golden/`、`baseline/`）不提交
+- 提交范围按目录决定：源代码与结论性记录（`scripts/`、`analysis/`、`evidence_db/`、`comparison_records/`）提交；原始大体积数据（`weights/`、`profiling/`、`golden/`、`baseline/`）不提交
 
 `.gitignore`：
 

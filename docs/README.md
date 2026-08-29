@@ -29,6 +29,7 @@
 - `2026-07-14/skill_improvement_analysis.md` — 等价替换独立为第四维度等方法论缺口回应
 - `2026-07-14/opt_explore_proposal.md` — 框架外新发现的探索与沉淀方案（opt_explore）
 - `2026-07-15/dual_line_analysis_proposal.md` — Phase 2 双线分析模型：源码结构线 + profiling 数据线
+- `2026-08-26/line_a_source_analysis_redesign.md` — Line A 重构：与 profiling 解耦，三层事实记录 + 判据推导疑点 + line_a_report.py + 轮次目录与合并分析（已实施）
 
 ### agent_process_discipline/ — agent 流程执行与决策纪律
 - `2026-07-16/process_enforcement_improvement.md` — 从"知识丰富流程松散"到"知识 + 流程门禁"

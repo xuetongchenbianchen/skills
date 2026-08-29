@@ -1,5 +1,11 @@
 # 案例库 Schema 说明
 
+## 目录
+
+- [定位](#定位) / [当前阶段目标](#当前阶段目标)
+- [Schema 字段说明](#schema-字段说明)——记录案例时按字段查：phenomenon / analysis_path / root_cause / parallel_splitting（切分案例专用）/ optimization / final_state / platform_findings / context
+- [填写原则](#填写原则) / [目录结构](#目录结构)
+
 ## 定位
 
 本文件是案例库的**构造语法说明**,agent 据此在项目工作目录的 `evidence_db/` 下记录优化案例。
