@@ -107,7 +107,7 @@ config.json / preprocessor_config.json  (最权威)
 
 两步走：**Golden 采集** → **按输出性质选择验证策略**。
 
-**Golden 采集**（显式步骤）：在 GPU（优先）或无 GPU 时 CPU 上运行**原始实现**，保存输出供比对。记录采集环境（设备、dtype、框架版本）保证可复现；落盘要求：离线可加载、不依赖采集设备：
+**Golden 采集**（显式步骤）：在 GPU（优先）或无 GPU 时 CPU 上运行**原始实现**，保存输出供比对。若要在CPU上运行，要注意取一个合适的样本，保证CPU在合理的负载下运行。记录采集环境（设备、dtype、框架版本）保证可复现；落盘要求：离线可加载、不依赖采集设备：
 
 ```python
 import numpy as np, json
