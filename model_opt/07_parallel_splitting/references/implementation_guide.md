@@ -8,7 +8,7 @@
 
 第四步按以下顺序推进（各节详述）：
 
-1. **接入决策**：切分落在输入边界还是模型内部（→「切分怎么接入模型」）
+1. **接入决策**：选择替换机制——monkey-patch / 子类覆写 / 源码内嵌（→「切分怎么接入模型」）
 2. **通信基建**：copy 基座 `comm_primitives.py`，按张量分布约定表从 `comm_recipes.py` 取用组合函数（→「通信原语」）
 3. **实现切分**：按分析的 `tensor_distribution_table` 逐模块实现并行 forward，权重按分布表切片加载（→「切分怎么接入模型」「权重处理」）
 4. **启动冒烟**：`torchrun --nproc_per_node=N` 启动——先 source CANN 环境脚本（见 [00 环境参考](../../00_adaptation/references/environment_reference.md)，含环境变量清单），`ASCEND_RT_VISIBLE_DEVICES` 与 `--nproc_per_node` 一致；最小输入跑通 + shape 断言（冒烟即验证 Tier 1）
@@ -16,11 +16,7 @@
 
 ## 切分怎么接入模型
 
-切分代码落在哪里，由切分发生在哪一级决定：
-
-**输入边界——模型零改动**：batch 维可切时（叠加 DP 扩吞吐），外层脚本分发样本、收集输出，模型完全不改，天然单卡兼容，换脚本即回退。
-
-**模型内部——替换相应模块的 forward**：切 seq / 权重 / 层 / 分支都要进入模型内部。并行版 forward 的写法只取决于张量分布表（逐张量配通信原语），剩下的差别只在**替换机制**——工程选择，不是分析决策：
+切 seq / 权重 / 层 / 分支都要进入模型内部——替换相应模块的 forward。并行版 forward 的写法只取决于张量分布表（逐张量配通信原语），剩下的差别只在**替换机制**——工程选择，不是分析决策：
 
 | 替换机制 | 适用 | 回退 |
 |---------|------|------|
@@ -51,7 +47,7 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 
 ### 混合并行的通信组构建
 
-多策略叠加（如切权重 × 切数据维度）时需创建子通信组。各维度的 rank 分配：切权重维度的 group 取连续 rank 段，切 batch 维度的 group 需含 `rank % (tp×pp)` 偏移（固定步长会导致 `new_group` 报错），切层维度的 group 取相同 stage 的 rank。
+多策略叠加（如切权重 × 切层维度）时需创建子通信组。各维度的 rank 分配：切权重维度的 group 取连续 rank 段，切层维度的 group 取相同 stage 的 rank。
 
 > rank 排列的性能约束：高频通信的组（切权重维度，每层集合通信）放节点内（HCCS 高带宽），跨节点链路留给低频通信。
 
@@ -75,6 +71,8 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 
 > 方案的数学等价性在分析阶段论证（★ 方案确认）；本节验证实施正确性与浮点容差，不可跳过。
 
+> **切分只验切分（耗时边界）**：本节验证回答且仅回答"切分实施是否正确"——张量分布是否符合约定表、通信原语是否配对、浮点容差是否在档。**不承担全量精度回归**（多样本、多 shape、top-1 一致性等）——那是切分通过、回归主流程后 Phase 4（04_accuracy_assurance）的职责。样本纪律：固定 **1 条代表性真实样本 + 1 条最小冒烟输入**，代表性样本覆盖被切维度的敏感特征（切 batch/含 padding → padding 边界；切 seq → 生产代表性长度；切权重 → 任一常规样本），规模取生产主流 regime 的中位代表——切分 bug 靠维覆盖暴露，不靠样本数量。
+
 > ★ 验证必须基于模板脚本 [scripts/verify_split.py](../scripts/verify_split.py)：agent 填写 `build_model` / `build_sample` / `run_inference` / `enable_parallel` 四个函数，禁止重写比较框架（`compare_outputs` / `bit_exact_diff` / 分层逻辑）。防作弊设计见脚本头部注释。
 
 **baseline 不可得时（权重本身超单卡）**：按超限原因选替代方案——
@@ -95,7 +93,7 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 4. 切分后：`torchrun --nproc_per_node=N verify_split.py --mode verify --split-type <同上>`
 5. 检查 `verify_report.json` 中 `overall=true` 才算通过（报告路径可用 `--report` 改名；基线目录默认 `./verify_baseline`，可用 `--baseline-dir` 指定）
 
-> `--split-type` 必须显式指定——脚本默认 order_changed 宽松档，不指定会静默落入 1e-3 容差。
+> `--split-type` 为**必填**（脚本强制）——未指定直接报错，防止静默落入 1e-3 宽松档。
 
 **核心原则**：tolerance 是通过门禁，bit-exact 仅 debug 工具。
 
@@ -122,9 +120,9 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 |------|------|------|
 | 1 冒烟 | 最小输入跑通 + shape 断言 | 逻辑不报错 |
 | 2a | 最小输入单卡 vs 多卡 tolerance | 快速定位逻辑错误 |
-| 2b | 真实规模多配置 tolerance | 最终通过标准 |
+| 2b | 单条代表性真实样本 tolerance | 最终通过标准 |
 
-> 模板脚本 `verify_split.py` 将 Tier 1 冒烟与 2a 合并为一条记录（`Tier1-smoke+2a`），分层强制语义不变（前一层不过不进下一层）。"真实规模"指锚点配置之外、单卡仍可跑通的最大规模——单卡放不下的配置无法产生单卡基线，其正确性由锚点配置验证 + 切分等价性论证（evidence_db `proofs`）共同背书。
+> 模板脚本 `verify_split.py` 将 Tier 1 冒烟与 2a 合并为一条记录（`Tier1-smoke+2a`），分层强制语义不变（前一层不过不进下一层）。"真实规模"取生产主流 regime 的代表样本（通常中位；仅当生产负载本身即最大规模时才取最大）——不为"测得全"而追加样本。单卡放不下的配置无法产生单卡基线，其正确性由锚点配置验证 + 切分等价性论证（evidence_db `proofs`）共同背书。
 
 ### 对比方法
 
@@ -135,7 +133,14 @@ copy 基座后：`from comm.comm_primitives import init_distributed, ParallelCon
 
 tolerance 未通过时，用最小输入做 bit-exact 逐元素对比定位差异来源。
 
-验证通过 → ★ 确认提交。未通过 → 回 [analysis_workflow.md](analysis_workflow.md) 修正切分方案（第二步维度选择 / 第三步等价性论证），再重新实施。
+验证通过 → ★ 确认提交。未通过 → 按「验证未过处置」路由，禁止直接放宽容差重跑：
+
+| 未过位置 | 结论 | 动作 |
+|---|---|---|
+| Tier 1 冒烟 / 2a（最小输入） | 实施错误（通信配对、shape、分布式逻辑） | 对照 `tensor_distribution_table` 排查，回第四步修复 |
+| 仅 Tier 2b（真实样本）超档 | 需消融定界，区分三类根因 | 依次执行：① fp32 通信重跑（排除归约顺序）② fp32 行并行 GEMM 重跑（排除计算顺序）③ 双跑 bit 一致性检查（暴露非确定性实现，如通信库归约顺序不固定） |
+| 消融定位到单点 | 可修实现问题 | 修复后重跑全部分层 |
+| 三项均无法消除、偏差符合形状级噪声预期（见 [analysis_workflow.md](analysis_workflow.md) 等价性论证）、方向一致（top1 / cosine 正常） | 切分固有数值噪声 | **例外审批**：`ask_user_question` 向用户说明消融证据与偏差量级 → 用户确认 → evidence_db 留痕（复现条件、容差边界、消融证据）→ 视为通过；禁止无依据放宽容差后重跑"通过" |
 
 ## 记录与回归（验证通过后）
 
@@ -155,7 +160,7 @@ tolerance 未通过时，用最小输入做 bit-exact 逐元素对比定位差�
 | 通信死锁、shape 不匹配等切分问题 | 本阶段（已知坑见下） |
 | 并行比单卡慢 | 回归 Phase 2（见「性能问题归属」） |
 
-排查第一步：原地运行 `comm_self_test.py`（`torchrun --nproc_per_node=N`）——通过则问题在切分实现逻辑，失败则是环境/部署问题。之后的通用排查（最小输入冒烟、打印 shape、抓栈）属常规调试能力，不在此展开；切分逻辑错误的排查 = 对照 `tensor_distribution_table` 找实现与契约的偏差。
+排查第一步：原地运行 `comm_self_test.py`（`torchrun --nproc_per_node=N`）——通过则问题在切分实现逻辑，失败则是环境/部署问题（需要校准通信参数供估算器用时加 `--timing`）。之后的通用排查（最小输入冒烟、打印 shape、抓栈）属常规调试能力，不在此展开；切分逻辑错误的排查 = 对照 `tensor_distribution_table` 找实现与契约的偏差。
 
 ### 性能问题归属
 

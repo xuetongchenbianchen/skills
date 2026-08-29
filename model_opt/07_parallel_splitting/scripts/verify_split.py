@@ -8,6 +8,14 @@
   - 分层强制：Tier 1 → 2a → 2b 顺序执行，前一层不过不进下一层
   - 阈值锁定：atol/rtol 由切分类型决定，运行时不可放宽
   - bit-exact 自动触发：tolerance 未通过时自动定位首个差异元素
+★ 样本纪律（耗时控制）：固定 1 条代表性真实样本 + 1 条最小冒烟输入。
+  切分验证只回答"切分实施是否正确"（张量分布 / 通信 / 浮点容差），不承担
+  全量精度回归——那是切分通过、回归主流程后 Phase 4（04_accuracy_assurance）
+  的事。代表性样本的选择标准：
+  1) 覆盖被切维度的敏感特征：切 batch / 含 padding → 须含 padding 边界；
+     切 seq → 生产代表性长度；切权重 → 任一常规样本即可
+  2) 规模取生产主流 regime 的代表（中位），不取最大——切分 bug 靠
+     维覆盖（padding/长度/被切维边界）暴露，不靠样本数量
 
 用法:
   # 1. 单卡采集基线（切分前，原始模型）
@@ -42,6 +50,9 @@ def build_model():
 def build_sample(sample_id: str):
     """构建确定性输入样本。同一 sample_id 必须返回完全相同的输入。
     ★ 禁止使用未设种子的随机数；如需随机，用 torch.manual_seed(42) 等固定种子。
+    ★ real_1 是唯一一条代表性真实样本，按文件头「样本纪律」选择：
+      覆盖被切维度的敏感特征（padding 边界 / 代表性长度），生产中位规模，
+      不取最大。禁止为"测得全"而追加样本——全量精度回归属主流程 Phase 4。
     """
     raise NotImplementedError("agent 填写：确定性输入构建")
 
@@ -133,8 +144,8 @@ def bit_exact_diff(a, b, path="root"):
 # 验证分层（★禁止修改★ — 前层不过不进下一层）
 # ═══════════════════════════════════════════════════════════
 
-SMOKE_ID = "smoke"              # 最小输入（agent 在 build_sample 中实现）
-REAL_IDS = ["real_1", "real_2"]  # 真实规模（agent 可改 ID，不可跳层）
+SMOKE_ID = "smoke"              # 最小输入：管线 sanity + shape 断言（agent 在 build_sample 中实现）
+REAL_IDS = ["real_1"]           # 唯一一条代表性真实样本（选择标准见文件头「样本纪律」）
 
 def _collect_baseline(baseline_dir):
     """单卡采集：对每个 sample 跑推理，保存输出。"""
@@ -191,7 +202,7 @@ def _verify(baseline, threshold, baseline_dir, report_path):
         print("[FAIL] Tier 1 冒烟未通过，终止")
         sys.exit(1)
 
-    # Tier 2b: 真实规模
+    # Tier 2b: 单条代表性真实样本（见文件头「样本纪律」）
     t2b = True
     for sid in REAL_IDS:
         r = _compare(sid, "Tier2b-real")
@@ -220,8 +231,8 @@ def _write_report(report, path):
 def main():
     ap = argparse.ArgumentParser(description="切分正确性验证模板（第七步）")
     ap.add_argument("--mode", choices=["baseline", "verify"], required=True)
-    ap.add_argument("--split-type", choices=list(THRESHOLDS), default="order_changed",
-                    help="order_preserved=1e-6 / order_changed=1e-3")
+    ap.add_argument("--split-type", choices=list(THRESHOLDS), required=True,
+                    help="order_preserved=1e-6 / order_changed=1e-3（必填，防止静默落入宽松档）")
     ap.add_argument("--baseline-dir", default="./verify_baseline")
     ap.add_argument("--report", default="verify_report.json")
     args = ap.parse_args()

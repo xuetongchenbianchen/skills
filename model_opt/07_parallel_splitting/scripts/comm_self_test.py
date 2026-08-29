@@ -5,15 +5,24 @@
 调试排查第一步: 本脚本通过 -> 问题在切分实现逻辑；本脚本失败 -> 环境/部署问题。
 
 用法:
-  torchrun --nproc_per_node=N comm_self_test.py
+  torchrun --nproc_per_node=N comm_self_test.py            # 环境自检（默认）
+  torchrun --nproc_per_node=N comm_self_test.py --timing   # 通信参数校准（α/带宽）
+
+--timing 模式测量真实环境下的等效通信参数（含各卡时长不齐的同步等待），
+输出可直接填入 estimate_split.py 的 spec.hardware 覆盖——未校准时估算器的
+典型值（α=20µs）可低估实际 AllReduce 耗时约 3 倍（straggler 等待为主因）。
 """
 
+import argparse
+import statistics
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import torch
+import torch.distributed as dist
 
 from comm_primitives import (init_distributed, ParallelConfig, all_gather,
                              all_gather_into_tensor, all_reduce, reduce,
@@ -21,6 +30,47 @@ from comm_primitives import (init_distributed, ParallelConfig, all_gather,
                              all_to_all)
 from comm_recipes import (local_chunk, allgather_along_dim, row_to_col,
                           col_to_row)
+
+
+def _bench_all_reduce(nbytes, iters=20, warmup=5):
+    """计时一次 AllReduce（fp32），返回每轮秒数（含同步等待，取中位数）。"""
+    cfg = ParallelConfig.get()
+    t = torch.ones(max(1, nbytes // 4), dtype=torch.float32, device=cfg.device)
+    for _ in range(warmup):
+        all_reduce(t)
+    dist.barrier()
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        all_reduce(t)
+        dist.barrier()
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times)
+
+
+def timing_test():
+    """校准等效通信参数：小消息定 α（延迟+等待项），大消息定带宽。"""
+    cfg = ParallelConfig.get()
+    rank, ws = cfg.rank, cfg.world_size
+    small_bytes, large_bytes = 64 * 1024, 64 * 1024 * 1024
+    t_small = _bench_all_reduce(small_bytes)
+    t_large = _bench_all_reduce(large_bytes)
+    if rank != 0:
+        return True
+    # Ring AllReduce 每卡实际搬运量 ≈ 2·(P-1)/P × 消息量；大消息耗时以此反推带宽
+    moved = 2 * (ws - 1) / ws * large_bytes
+    eff_bw = moved / t_large / 1e9
+    # 小消息耗时 ≈ S·α（Tree S=2·log2(P)），反推等效 α；直接取单次耗时作保守值亦可
+    import math
+    alpha_us = t_small / (2 * max(1, math.ceil(math.log2(ws)))) * 1e6
+    print(f"[timing] world_size={ws}")
+    print(f"  小消息 AllReduce ({small_bytes // 1024}KB): {t_small * 1e6:.1f} µs/次")
+    print(f"  大消息 AllReduce ({large_bytes // 1024 // 1024}MB): {t_large * 1e3:.3f} ms/次")
+    print(f"  等效 α ≈ {alpha_us:.1f} µs（含同步等待）；等效带宽 ≈ {eff_bw:.0f} GB/s")
+    print("  建议填入 spec 覆盖典型值:")
+    print(f'    "hardware": {{"alpha_us": {round(alpha_us, 1)}, '
+          f'"bandwidth_GBs": {round(eff_bw)}}}')
+    return True
 
 
 def self_test():
@@ -127,6 +177,10 @@ def self_test():
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="通信原语环境自检 / 通信参数校准")
+    ap.add_argument("--timing", action="store_true",
+                    help="校准模式：测量等效 α 与带宽，输出 spec 覆盖建议（跳过功能自检）")
+    args = ap.parse_args()
     init_distributed()
-    ok = self_test()
+    ok = timing_test() if args.timing else self_test()
     raise SystemExit(0 if ok else 1)
