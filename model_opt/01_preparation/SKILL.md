@@ -82,20 +82,12 @@ python <skill_path>/01_preparation/scripts/validate_profiling_env.py --device np
 
 基线来源即上文「Baseline 语义」确定的优化前 NPU 自身输出；对比方法论（按输出类型选择距离函数、阈值在比较前声明）遵循 [04_accuracy_assurance/SKILL.md](../04_accuracy_assurance/SKILL.md)。本阶段只构建脚本框架，不定义具体方法论。
 
-### 输出保存
+### 工具
 
-原则：离线可加载、不依赖设备、可复现。
+直接使用 [04_accuracy_assurance/scripts/compare_precision.py](../04_accuracy_assurance/scripts/compare_precision.py)（模板脚本，agent 填 5 个函数）：
 
-```python
-import numpy as np, json
-np.save(f"baseline/{sample_id}_output.npy", output.cpu().float().numpy())
-with open(f"baseline/{sample_id}_tokens.json", "w") as f:
-    json.dump({"tokens": token_ids}, f)
-```
-
-### 对比脚本要求
-
-自包含（给定 baseline 目录和当前输出目录即可独立运行），指标和阈值显式声明，运行后输出判定结论。
+- baseline 采集：`python compare_precision.py --mode baseline --runs 3`——输出落盘（离线可加载、不依赖设备、可复现），同时测自然波动 D_base
+- 优化后对比：`python compare_precision.py --mode compare`——按输出类型选度量、按 3×P99(D_base) 校准阈值，输出判定报告（退出码非 0 = 未通过）
 
 ### 确定性条件
 
