@@ -127,6 +127,6 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 ## 迭代退出条件
 
-由用户在确认节点 C 中决定是否继续。agent 应基于下界分析提供量化建议：满足 [bound_analysis.md](references/bound_analysis.md)「终局判断」中**任一**条件时建议停止。
+由用户在确认节点 C 中决定是否继续。agent 应基于下界分析提供量化建议：满足 [bound_analysis.md](references/bound_analysis.md)「终局判断」的整体终局条件（Free 侧与 Computing 侧**同时**耗尽，或兜底条件成立）时建议停止——注意 L0 Free < 10% 只说明 host 侧到头，须继续评估 Computing 侧（碎片算子融合/去重/替换）后才可建议停止。
 
 终局判断前必须穷尽 NPU 融合算子库，不能仅看 utilization 数字下结论。
