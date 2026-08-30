@@ -288,6 +288,7 @@ python parse_operator_memory.py /path/to/profiling --top-k 20
 
 **输出包含**：
 0. **Detected Layers**：探测到的各层事件数；若缺 cpu_op/Call stack，明确提示"需重采开启 with_stack"，不静默出空
+0b. **Host 开销分层构成**：`python_function` 区间并集扣除 `cpu_op` 重叠 = Python/Module 机制层，`cpu_op` 并集 = 算子调用层（aten→aclnn dispatch 链）。产出 [SIGNAL] 分层占比——**编译门槛判定输入**：Python 层显著（默认 ≥30%）→ jit.script/flat forward 等 eager 框架手段先行；算子调用层主导 → eager 框架手段收益有限，直接评估层次 3 图编译（见 03 compilation_tools「与四维度优化的顺序」）。需 with_stack=True 的 L1 数据，缺失时明确提示
 1. **Device Timeline**：只列含 compute 任务的 stream（span/active/busy%/kernel 数），其余通信/同步/DMA 流折叠成一行；compute 任务间的 gap 分布
 2. **Device Stalls**：≥ 阈值的空隙**按(前→后 kernel 对)聚合**，给出出现次数、累计 gap、平均、最大，按累计降序——反复出现且累计大的才值得优化，避免被大量个例淹没
 3. **Dispatch Latency**：HostToDevice flow 配对得到的下发延迟分布（avg/max/p50/p90）+ 最慢的 top-N（附最近 device kernel 名）
@@ -301,6 +302,7 @@ python parse_operator_memory.py /path/to/profiling --top-k 20
 
 **何时使用**：
 - step_trace 判定 host-bound 后，用它定位 host 侧到底在忙什么（下发 / 编译 / 同步）
+- **判定编译门槛**：§0b 的分层构成回答"eager 框架手段（jit.script/flat forward）还剩多少可做"——②a Python 层 vs ②b/②c 算子调用层的占比是 03 编译前置条件的测量依据
 - 定位 host2device bound 区段：第 4 节直接给出"哪段时间、哪段代码 host 喂不动设备"，配合 §3 全局下发延迟判断是局部还是系统性问题
 - 需要 host→device 下发链、区分首次编译（A 类，采集可解）与每步在线编译（B 类，执行模式问题）时
 - 找预取 / 预分配 / buffer 复用等**不换算子**的优化点，并用 Call stack 定位到源码

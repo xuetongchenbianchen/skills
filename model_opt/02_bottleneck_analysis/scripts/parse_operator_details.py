@@ -153,7 +153,7 @@ def parse_overview(profiling_dir: str, rank=None, top_k: int = 15) -> str:
 
     lines.append(f"  纯 Host Op 合计: {pure_host_total/1000:.1f} ms ({pure_host_pct:.1f}% 占全部 host 时间)")
     if metadata_ops or wrapper_ops:
-        lines.append(f"    Metadata op（无任何 device 工作）: {metadata_total/1000:.1f} ms — 编译可自动消除")
+        lines.append(f"    Metadata op（无任何 device 工作）: {metadata_total/1000:.1f} ms — 仅层次 3 图编译可消除（jit.script/trace 保留 aten dispatch，够不到 metadata op）")
         lines.append(f"    Dispatch wrapper（自身无 device，子 op 有）: {wrapper_total/1000:.1f} ms — 正常调用层次开销")
     lines.append("")
 

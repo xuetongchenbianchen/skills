@@ -25,6 +25,20 @@ npu-smi info        # 复查确认显存/算力已释放
 3. 按全流程顺序执行，不跳步
 4. 进入每个phase后，所有reference文件需要按需加载，确认已读/跳过状态，并在 evidence_db 中记录
 
+## 探索规模路由（Phase 1 末判定，★A 可调档）
+
+subagent 深挖用于追求极致优化，不是默认形态——轻量模型纯主线实施效果相当，成本低一个量级。Phase 1 基线齐备后路由，用户可在 ★A 覆盖默认档。
+
+判定信号（零额外成本可得）：wall-clock median、单 forward kernel 数、层同构度、evidence_db 有无同架构先例。
+
+| 档位 | 默认触发 | 执行形态 |
+|------|---------|---------|
+| 轻量 | wall < ~10ms 且 kernel < ~300 且层高度同构（如 86M/12 同构层/228 kernel 的小 ViT） | 纯主线：两线分析主线串行，实施不 spawn，可行性靠 reference 查证 |
+| 标准 | 中间地带 | 双线 spawn 分析 + Level 2+ 方案 spawn 实施 |
+| 深挖 | 用户要求逼近下界，或首轮显示 >3× 空间且根因跨层交织 | 全量纪律 + 终局判断 |
+
+档位只设默认，价值判断留给用户（高 QPS 小模型可声明升档）。轻量档纪律不降级：失败留证据、逐方案 Level 1 验证、Phase 4 门禁不省。
+
 ## 核心原则
 
 - **Profiling 驱动**：所有优化决策必须有 profiling 数据支撑
@@ -112,7 +126,7 @@ Phase 5  工程化提交（git commit + evidence_db 记录）
 
 **Phase 2 瓶颈分析**：新轮次强制重置——每轮重新采集 L1、重新分析，禁止沿用上轮结论（性能 profile 已变）。开局做下界分析路由重心（Free 侧 / Computing 侧），双线并行分析（Line A 源码线 + Line B profiling 线，各 spawn 一个 subagent）→ 合并产出 `candidates.md` 问题点清单。详见 [02_bottleneck_analysis/SKILL.md](02_bottleneck_analysis/SKILL.md)。
 
-**Phase 3 优化实施**：两步走——**方案设计**：对照 candidates.md 的每个问题点，用四维度（去重、复用、掩盖、替换）框架设计具体方案（无方案的须解释原因），落盘 `analysis/round_{N}/solutions.md`，经 **★A 用户确认**；**逐条实施**确认的方案（每方案 spawn 一个 subagent 深挖，持久性要求见 03「逐条实施：subagent 深挖」），每条改动后做 Level 1 快速精度验证，实施中放弃须满足 03 的「方向放弃标准（分级）」。全部方案处理完毕即进入 Phase 4。
+**Phase 3 优化实施**：两步走——**方案设计**：对照 candidates.md 的每个问题点，用四维度（去重、复用、掩盖、替换）框架设计具体方案（无方案的须解释原因），落盘 `analysis/round_{N}/solutions.md`，经 **★A 用户确认**；**逐条实施**确认的方案（实施位置路由与 spawn 注入三要素见 03「逐条实施」），每条改动后做 Level 1 快速精度验证，实施中放弃须满足 03 的「Level 分级：探索深度与放弃标准」。全部方案处理完毕即进入 Phase 4。
 
 **Phase 4 精度验证 + Profiling 确认**：本批（本轮优化阶段）所有优化完成后，**必须依次完成**：
 1. 全量精度验证（方法论见 [04_accuracy_assurance](04_accuracy_assurance/SKILL.md)）—— 与原始 baseline 对比，确认精度无退化

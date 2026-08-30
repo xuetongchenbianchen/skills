@@ -13,11 +13,11 @@
 
 | 测量 | 定义 | 采集方式 | 用途 |
 |------|------|---------|------|
-| **wall-clock** | 无 profiler 的真实端到端时间 | `torch.npu.synchronize()` → 计时 → `synchronize()` → 计时，取 ≥20 次中位数 | 真实性能基准；下界分析 wall-clock |
-| **L0** | 仅 NPU 活动的 profiling，不注入 CPU barrier | `torch_npu.profiler.profile(activities=[NPU])` + `tensorboard_trace_handler` | kernel 执行时间（L0 Computing）+ device 空闲时间（L0 Free）；下界分析；L0/L1 交叉验证 |
+| **wall-clock** | 无 profiler 的真实端到端时间 | `torch.npu.synchronize()` → 计时 → `synchronize()` → 计时，取 ≥20 次中位数 | 真实性能基准；下界分析|
+| **L0** | 仅 NPU 活动的 profiling，不注入 CPU barrier | `torch_npu.profiler.profile(activities=[NPU])` + `tensorboard_trace_handler` | 下界分析；L0/L1 交叉验证 |
 | **L1** | CPU + NPU + 调用栈 + 内存 + AI Core 指标的 profiling | `torch_npu.profiler.profile(activities=[CPU,NPU], with_stack=True, ...)` + `tensorboard_trace_handler` | 瓶颈分析主力；交给 `run_analysis.py` |
 
-**覆盖范围一致**：三者的"被测代码段"必须完全相同。例如若 wall-clock 框了 `input.to(device) + model(input)`，则 L0/L1 的 `with profiler.profile(...)` 块内也必须是 `input.to(device) + model(input)`。范围不一致会导致 wall-clock 与 L0 Computing + L0 Free 的关系失真，进而导致下界分析的优化空间估算错误。
+**覆盖范围一致**：三者的"被测代码段"必须完全相同。例如若 wall-clock 框了 `input.to(device) + model(input)`，则 L0/L1 的 `with profiler.profile(...)` 块内也必须是 `input.to(device) + model(input)`。
 
 > wall-clock 不使用 profiler，是唯一不受 profiler 开销影响的测量。L0 虽然最轻量但仍引入少量开销（L0 Free 会高估真实 host 开销）。L1 的 barrier 注入严重扭曲 host 时间（高估可达数十倍），但算子级数据（op_statistic、kernel_details 等）仍然有效。
 

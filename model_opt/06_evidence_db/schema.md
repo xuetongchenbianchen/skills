@@ -156,6 +156,7 @@
 4. **切分与优化分开记录**: 多卡切分完成时写一个**切分案例**(填 `parallel_splitting` 节,`optimization` 留空);每经过一轮完整的 Phase 2->4 写一个**优化案例**(填 `optimization.attempts`,切分模型上的优化用 `depends_on` 指向所基于的切分案例)。
 5. **不强求归类**: bottleneck_type 和 dimension 能判断就写,判断不了写"mixed"并在 description 中说明。
 6. **平台发现独立记录**: NPU 特有的行为洞察写在 platform_findings 中,不要埋在 notes 或 failure_reason 里——这些发现跨越单个案例,对后续项目有指导价值。
+7. **结论必须带前提**: platform_findings、failure_reason 及一切"X 不可用 / X 劣于 Y"类结论须记录成立前提(图结构 / 环境变量 / dtype / 版本 / batch 规模)。用途有二:① 前提变化时旧结论须重验;② 死路清单(03「Level 分级」前置过滤)据此判断路径是永久死路还是前提已变的待重验项。无前提的结论按不可信处理。
 
 ## 目录结构
 

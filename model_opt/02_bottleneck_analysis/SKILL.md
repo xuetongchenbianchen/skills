@@ -30,7 +30,7 @@ Phase 2 的分析由两条线驱动,完全解耦、可并行:
 **执行流程**:
 
 1. 采集 L1
-2. **双线并行分析**——环境支持子 agent 时，两条线各 spawn 一个 subagent 执行（不支持时主线串行，产出要求相同）：
+2. **双线并行分析**——环境支持子 agent 时，两条线各 spawn 一个 subagent 执行（环境不支持、或主 SKILL「探索规模路由」判轻量档时，主线串行执行，产出要求相同）：
    - **Line B subagent**：跑 `run_analysis.py --output analysis/round_{N}/line_b_report.md`，按 [profiling_to_action.md](references/profiling_to_action.md) 方法论对全部 DEFINITE/WARNING 信号做根因追踪，返回追踪记录
    - **Line A subagent**：穿透框架 → 按三层记录事实 → 对照判据推导疑点（详见 [proactive_source_analysis.md](references/proactive_source_analysis.md)），填写 findings.yaml 并跑 `line_a_report.py` 落盘报告
    - subagent 的独立上下文让每条线都能做深（Line B 逐算子下钻、Line A 通读源码）而不挤占主线；spawn 时须在 prompt 中给出对应方法论文档路径、L1 目录与产物要求
@@ -38,6 +38,7 @@ Phase 2 的分析由两条线驱动,完全解耦、可并行:
 
 **关键约束**:
 - Line B 和 Line A **都必须执行**,不设跳过条件——Line B 覆盖可见瓶颈,Line A 覆盖 profiling 盲区
+- **round ≥ 2 时 Line A 增量收敛**：范围 = 本轮变更涉及的实现/图结构 + 上轮遗留疑点，不重做全量三层分析（首轮必须全量建立基线认知）；Line B 照常每轮全量重采重析。图/编译 dump 只保留摘要级算子清单，原始 dump 不入库
 - 两线不互相消费:Line A 的分析范围由生成模式推导的热路径收敛(非热路径只记架构行);疑点量化发生在合并阶段
 - 候选 = 结构根因(Line A) + 量化影响(Line B)的交点——散落的信息点只有交叉关联后才成为完整候选
 

@@ -31,7 +31,11 @@
 把"慢"归到一类可消除的浪费。**十类浪费的定义与收益上限见 [waste_taxonomy.md](waste_taxonomy.md)（跨线统一分类）**；本节按类别给出 Line B 侧的识别信号（profiling 现象）与典型场景。
 
 1. **① 显式同步开销**——信号：host 侧出现 D→H 同步类操作且占比高。典型：HuggingFace Trainer 每步 grad clip/NaN check 调 .item()
-2. **② dispatch/调度开销**——信号：host dispatch 时间占比高、设备 idle 但 host 在框架层忙碌
+2. **② dispatch/调度开销**——信号：host dispatch 时间占比高、设备 idle 但 host 在框架层忙碌。归因时**必须产出分层构成**（数据来源：trace_view §0b Host 开销分层 + operator_details 按 Category 拆解），它是 03 编译门槛与工具选择的判定输入：
+   - **②a Python/Module 机制层**（Module.__call__ / hook / __getattr__ / 解释器）——jit.script、flat forward 等 eager 手段可达
+   - **②b aten dispatch 链**（aten::op → aclnnXxx 的逐算子调度，含 metadata op）——仅层次 3 图编译可达
+   - **②c aclnn tiling/launch**（CANN host 侧参数计算与下发）——仅层次 3 图编译可达
+   - 判定：②a 占比显著（如 ≥30%）→ eager 框架手段先行并测得终点再决定编译；②b/②c 主导 → eager 框架手段收益有限，直接评估图编译
 3. **③ 内存管理阻塞**——信号：内存管理类 host 时间占比高、高频分配释放
 4. **④ 在线编译/重编译**——信号：编译事件贯穿全程（非仅预热期）
 5. **⑤ 内存带宽受限**——信号：mte 占比远大于 mac、带宽利用率接近峰值
@@ -55,8 +59,8 @@
 在 operator_details 中发现高 host self time 但不在上述 10 类的识别信号中时，按以下路径推理归因：
 
 1. 用 `--filter <op_name>` 查看 call stack，判断是框架内部操作还是业务代码
-2. 若是框架内部操作（TorchScript 函数名、aten:: 前缀、框架容器索引等）→ 归因到"dispatch/调度开销"（第 2 类）
-3. 若是业务代码 → 检查是否属于框架调用链开销（Module.__call__、__getattr__），归因到"dispatch/调度开销"（第 2 类）
+2. 若是框架内部操作（TorchScript 函数名、aten:: 前缀、框架容器索引等）→ 归因到"dispatch/调度开销"（第 2 类），并按 ②a/②b/②c 细分到子层
+3. 若是业务代码 → 检查是否属于框架调用链开销（Module.__call__、__getattr__），归因到"dispatch/调度开销"（第 2 类）的 ②a 子层
 4. 若 device time 为 0 且不属于以上 → 检查是否为内存/元数据操作被错误归类，归因到"内存管理阻塞"（第 3 类）
 
 ## 3. 源码定位
