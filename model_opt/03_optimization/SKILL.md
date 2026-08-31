@@ -1,6 +1,6 @@
 ---
 name: npu-optimization-implementation
-description: 优化实施：用去重/复用/掩盖/替换四维度框架实施性能优化。当用户需要实施优化方案、融合算子、预分配 buffer、编译工具（TorchScript/torch.compile）、flat forward、或换等价实现时触发。
+description: 优化实施：用去重/复用/掩盖/替换四维度框架实施性能优化，含内存工程（峰值显存优化：分块计算、缓存生命周期、副本消除）。当用户需要实施优化方案、融合算子、预分配 buffer、编译工具（TorchScript/torch.compile）、flat forward、换等价实现、或降低峰值显存/解决 OOM 时触发。
 ---
 
 # NPU 优化实施
@@ -75,6 +75,23 @@ subagent 零上下文启动，prompt 必须注入：
 | 复用 | [reuse_and_precompute.md](references/reuse_and_precompute.md) | 预计算缓存、预分配 buffer、原地操作 |
 | 掩盖 | [hide_latency.md](references/hide_latency.md) | 通信-计算重叠、双 buffer 流水 |
 | 替换 | [equivalent_substitution.md](references/equivalent_substitution.md) | NPU 融合算子、换等价 API、换算法 |
+
+## 内存工程（让单卡放得下）
+
+四维度框架是速度导向的；"降低单卡峰值显存"是另一条有独立验收的工作线，两个触发入口：
+
+1. **07 并行切分的承重前提**：切分方案经病因对账（见 [07 analysis_workflow「第零步」](../07_parallel_splitting/references/analysis_workflow.md)）确认不覆盖 OOM 阶段时（如按独立分支切分、主干每卡冗余），"单卡装下"由该方案确认时立项，**在切分实施前完成**
+2. **Phase 2/3 直接发现**：瓶颈分析定位到显存受限（swap / OOM / 被迫小 batch）
+
+手段（数值等价性要求与替换维度同级，验证协议见 [equivalence_verification.md](references/equivalence_verification.md)）：
+
+- **分块计算**（row/tile chunking）：[N,...,C] 算子沿可切维分块执行，峰值有界、代数不变。注意两点：① 逐算子核对语义——广播对齐方式（如 mask 对 batch 维的广播）、自配对距离类算子（行块得到 [B,B] 而非 [B,N]）是实测高频坑；② GEMM tiling 改变引入 1e-7(fp32)~1e-5 级形状噪声，须与原实现 A/B 对齐
+- **生命周期管理**：跨阶段死缓存的显式清理（算完即 clear）、旧引用提前释放（residual 读后即断）、in-place 替代 out-of-place 副本
+- **布局与副本消除**：permute+contiguous 的大副本改为分块写入目标布局；避免瞬时双份
+
+验收：真实规模（或缩配锚点）跑通 + 与原实现的分层 tolerance 对齐 + 峰值实测（`torch.npu.max_memory_allocated()`）留档。
+
+**收敛熔断**：OOM 逐点转移（修一处挪一处）累计 ≥3 轮 → 停止逐点修补，先复审分诊归因（回读全部 OOM traceback 建崩溃位置图谱，与病因清单比对——实际崩溃位置与归因不符 = 初始内存模型错误，先修模型再修内存），再重估峰值模型（分配器碎片 / 隐藏常驻 / 算子 workspace——把实测差值作为隐藏项计入），仍无 ≥10% 余量则回 07 重选切分方案（内存工程换不来余量时，病因必须回到切分层解决）。
 
 ## 场景专用 Reference
 
