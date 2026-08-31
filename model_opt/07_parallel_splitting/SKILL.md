@@ -25,7 +25,7 @@ npu-smi info        # 复查确认显存/算力已释放
 1. **Phase 0 冒烟分诊触发**：[00_adaptation/SKILL.md](../00_adaptation/SKILL.md)「冒烟测试与 OOM 分诊」分诊确认"本质需要并行" → 进入本子技能全流程
 2. **用户直接触发**：用户报告显存不足/需要多卡/要求模型并行 → 直接进入全流程
 
-**与各 Phase 交互**：Phase 0 冒烟分诊（见 [00_adaptation/SKILL.md](../00_adaptation/SKILL.md)「冒烟测试与 OOM 分诊」）确认本质需要并行 → 进入本子技能完成全流程（第一步~第六步，见下方「全流程」）→ 验证通过后回归 Phase 0 完成适配精度验证 → Phase 1 采集并行基线（L0/wall-clock）→ 进入 Phase 2 瓶颈分析 → Phase 3 四维度优化 → Phase 4 门禁 → Phase 5 提交（evidence_db 纳入）。回退路径：`disable_parallel()` 回到单卡，回到 model_opt 四维度优化。
+进入本子技能完成全流程（第一步~第六步，见下方「全流程」）→ 验证通过后回归 Phase 0 完成适配精度验证。回退路径：`disable_parallel()` 回到单卡，回到 model_opt 四维度优化。
 
 ## 核心原则
 
@@ -33,9 +33,6 @@ npu-smi info        # 复查确认显存/算力已释放
 - **禁止修改模型架构**：切分只改变计算的分布方式，不改变模型的数学语义和结构
 - **三角度论证**：切分方案必须从数学正确性、完备性、系统可行性三个角度论证；张量分布约定表在方案确认后落盘为工作契约（供实施/验证对照），验证通过后随切分案例记录到 [evidence_db](../06_evidence_db/schema.md)（`parallel_splitting` 字段）
 
-## 范围边界：吞吐优先不是切分问题
-
-显存充足且用户指标是**吞吐**（samples/s、条/秒）时，模型切分不是答案——多实例部署（每卡独立跑完整模型、请求层分发）属部署层动作，超出本技能范围。此时向用户说明边界并退出，**不要**进入切分分析。判断依据：指标是延迟（单请求 ms）或显存不足 → 本技能；指标是纯吞吐且显存够 → 部署层。用户同时要吞吐和延迟时（如"都要"），先声明两者由不同手段承载，再按延迟目标走本技能，吞吐需求作为部署层结论一并交代。
 
 ## 全流程
 
@@ -43,11 +40,12 @@ npu-smi info        # 复查确认显存/算力已释放
 前置：Phase 0 冒烟分诊（见 00_adaptation/SKILL.md「冒烟测试与 OOM 分诊」）已确认本质需要并行
    ↓
 分析阶段（agent 读源码分析 + 脚本估算）             详情: analysis_workflow.md
-   第一步  什么在吃显存？（提取参数 → 内存时间线）
+   第一步  什么在吃显存？（提取参数 → 内存时间线 → OOM 根因组件清单）
    第二步  切哪个维度？（定性分类 → 候选并行模式）
    第三步  通信代价与可行性（有真实多卡环境时先 `comm_self_test.py --timing` 校准 α/带宽
-          → 填 spec（含已有单卡 wall-clock 的 compute_ms，启用收益侧）→ estimate_split.py 定量估算
-          → break-even）+ 数学等价性论证（代数恒等 + 数值噪声预期，见 analysis_workflow）
+          → 填 spec（计算耗时由脚本按 FLOPs 解析估算，无需单卡实测）
+          → estimate_split.py 定量估算 → 候选裁决：净收益≤0 剪掉；差异超出误差带（~30%）延迟定胜负，
+          带内并列候选才允许以工程量决胜）+ 数学等价性论证（代数恒等 + 数值噪声预期，见 analysis_workflow）
    ↓
  ★ 方案确认（`ask_user_question`：展示切分方案 + 定量估算 + 等价性论证 + 风险应对 → 确认/裁剪）
    ↓
@@ -83,7 +81,7 @@ npu-smi info        # 复查确认显存/算力已释放
 | 分析 | [analysis_workflow.md](references/analysis_workflow.md) | 切分的两个判定 + 拓扑定哪里可切 → 什么在吃显存 → 切哪个维度 → 通信代价与等价性论证 → 通信效率层次 → 方案确认 |
 | 实施 + 验证 + 调试 | [implementation_guide.md](references/implementation_guide.md) | 实施主线路径 + 接入决策（边界/内部 + 替换机制）+ 通信原语（基座/组合/自检三件）+ 权重处理 + 验证方法 + 调试排查 |
 | 通信基建 | [scripts/comm_primitives.py](scripts/comm_primitives.py) / [comm_recipes.py](scripts/comm_recipes.py) / [comm_self_test.py](scripts/comm_self_test.py) | 基座整文件 copy；切分组合函数按需取用；环境自检原地运行（`--timing` 兼作通信参数校准，供 spec hardware 覆盖） |
-| 估算脚本 | [scripts/estimate_split.py](scripts/estimate_split.py) | 第三步显存/通信/收益估算：填 spec（含 compute_ms 与实测 α）→ 原地运行（无需 copy）→ 读报告排序（提供 compute_ms 时按估算延迟/净收益排序） |
+| 估算脚本 | [scripts/estimate_split.py](scripts/estimate_split.py) | 第三步显存/通信/收益估算：填 spec（含实测 α；计算耗时由脚本 FLOPs 解析估算）→ 原地运行（无需 copy）→ 读报告排序与推荐结论 |
 | 验证模板 | [scripts/verify_split.py](scripts/verify_split.py) | 切分前后输出对比（分层 tolerance + bit-exact debug + verify_report.json） |
 | 案例记录 | [06_evidence_db/schema.md](../06_evidence_db/schema.md) | `parallel_splitting` 字段定义 |
 

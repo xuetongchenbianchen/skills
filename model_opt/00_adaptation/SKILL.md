@@ -72,7 +72,7 @@ config.json / preprocessor_config.json  (最权威)
 
 **设备适配写法**（最小改动原则的落地）：
 
-1. **import 顺序**：先设环境变量（`TASK_QUEUE_ENABLE=2` 等，完整清单见 [environment_reference.md](references/environment_reference.md) §3），再 `import torch_npu`
+1. **import 顺序**：先设环境变量（完整清单见 [environment_reference.md](references/environment_reference.md) §3），再 `import torch_npu`
 2. **设备指定**：`torch.device("npu")`（或 `"npu:0"`）；可见卡由 `ASCEND_RT_VISIBLE_DEVICES` 控制
 3. **CUDA 代码迁移**，两种方式选一：
    - 零改动：`import torch_npu` 后调用 `transfer_to_npu()`，`.cuda()` / `"cuda"` 自动映射到 NPU——适用于不改业务代码的场景（Phase 1 采集规范即基于此）
@@ -95,19 +95,18 @@ config.json / preprocessor_config.json  (最权威)
 - **权重常驻本身超限**（> HBM × 0.8）→ 直接进入 [07_parallel_splitting](../07_parallel_splitting/SKILL.md)，不进入实测
 - 估算明显放得下 → OOM 另有原因，进 Step 3
 - dtype 不一致在此自然暴露：估算按实际加载的 dtype 计数，原始 bf16 被默认加载成 fp32 时参数字节翻倍（`from_pretrained` 不带 `torch_dtype` 的坑）
-- 识别主导张量时**同时记录缩放规律**（KV cache 类随序列线性、实体化 attention score 类随序列平方），供 Step 3 外推
+- 识别主导张量时**逐个产出初步 OOM 根因组件清单**：组件名称、大小、沿哪维增长、随 workload 的缩放规律——既是"可修复 vs 需并行"的裁决依据，也随分诊结论带入 07 第一步（在其基础上补全全组件时间线与层内峰值分解，不重复测算）
 
-**Step 3 小 shape 实测 + 外推**（条件步骤，仅"估算放得下却 OOM"或边界带时进入）：用小输入跑通并记录 `memory_allocated` 随 shape 的增长曲线，外推到真实 workload——普通运行 + 显存统计，不是 profiler。跑通是前提：驻留、碎片只有跑起来才可见。
+**Step 3 小 shape 实测：归因估算偏差**（条件步骤，仅"静态估算放得下却 OOM"或估算接近限值时进入）：用小输入跑通并记录 `memory_allocated` 随 shape 的增长曲线——普通运行 + 显存统计，不是 profiler。跑通是前提：驻留、碎片只有跑起来才可见。
 
-- 前提由 Step 2 保证：进入本步意味着权重必然能加载；曲线中常驻部分（权重）是基线偏移，可变部分（激活/驻留）才是外推对象
-- 外推按 Step 2 识别的缩放规律拟合（线性 / 平方），不默认线性
+- **首要任务是归因静态看不见的运行时效应**：实测远超估算 → 按方向检查 `no_grad` 缺失 / 全局引用导致的张量驻留 / 分配器碎片（`max_memory_allocated` vs `memory_allocated`）——修复后回冒烟；驻留与碎片不修就切分，照样吃掉切分收益
+- **估算接近限值时才外推**：曲线中常驻部分（权重）是基线偏移，可变部分才是外推对象；按 Step 2 记录的缩放规律拟合（线性 / 平方，不默认线性）外推到真实 workload 裁决。判放不下 → 进 07，增长曲线随根因清单一并作为 07 第一步输入
 - 加载阶段即 OOM（尚未 forward）：显存与 shape 无关，本步不适用——按加载路径问题处理（加载期 dtype 中转或临时拷贝），复查无果即切分
-- 实测远超估算时按偏差解释方向检查：`no_grad` 缺失 / 全局引用导致的张量驻留、分配器碎片（`max_memory_allocated` vs `memory_allocated`）
 
 **分诊结论**：
 
 - **可修复**（输入失真 / 加载问题 / 驻留）→ 修正后回冒烟
-- **本质需要并行** → 进入 [07_parallel_splitting](../07_parallel_splitting/SKILL.md) 全流程（分析 → 实施 → 验证）；切分验证通过后回归 0.5 完成适配精度验证（天然在多卡配置下执行）
+- **本质需要并行** → 携带 Step 2 初步根因组件清单（及 Step 3 增长曲线，若跑过）进入 [07_parallel_splitting](../07_parallel_splitting/SKILL.md) 全流程（分析 → 实施 → 验证）；切分验证通过后回归 0.5 完成适配精度验证（天然在多卡配置下执行）
 
 > 分诊止损：三条判据无果即切分，不在适配阶段死磕。简单数据并行（DP only，多独立样本）不属于模型并行，直接配置 `ASCEND_RT_VISIBLE_DEVICES` 多卡即可，不触发本流程。
 
