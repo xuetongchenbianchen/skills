@@ -25,7 +25,7 @@ npu-smi info        # 复查确认显存/算力已释放
 1. **Phase 0 冒烟分诊触发**：[00_adaptation/SKILL.md](../00_adaptation/SKILL.md)「冒烟测试与 OOM 分诊」分诊确认"本质需要并行" → 进入本子技能全流程
 2. **用户直接触发**：用户报告显存不足/需要多卡/要求模型并行 → 直接进入全流程
 
-**与各 Phase 交互**：Phase 0 冒烟分诊（见 [00_adaptation/SKILL.md](../00_adaptation/SKILL.md)「冒烟测试与 OOM 分诊」）确认本质需要并行 → 进入本子技能完成全流程（第一步~第六步，见下方「全流程」）→ 验证通过后回归 Phase 0 完成适配精度验证 → Phase 1 采集并行基线（L0/wall-clock）→ 进入 Phase 2 瓶颈分析 → Phase 3 四维度优化 → Phase 4 门禁 → Phase 5 提交（evidence_db 纳入）。回退路径：`disable_parallel()` 回到单卡，回到 model_opt 四维度优化。
+**与各 Phase 交互**：Phase 0 冒烟分诊（见 [00_adaptation/SKILL.md](../00_adaptation/SKILL.md)「冒烟测试与 OOM 分诊」）确认本质需要并行 → 进入本子技能完成全流程（第零步~第六步，见下方「全流程」）→ 验证通过后回归 Phase 0 完成适配精度验证 → Phase 1 采集并行基线（L0/wall-clock）→ 进入 Phase 2 瓶颈分析 → Phase 3 四维度优化 → Phase 4 门禁 → Phase 5 提交（evidence_db 纳入）。回退路径：`disable_parallel()` 回到单卡，回到 model_opt 四维度优化。
 
 ## 核心原则
 
