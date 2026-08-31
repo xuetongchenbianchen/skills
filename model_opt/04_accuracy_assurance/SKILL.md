@@ -122,6 +122,8 @@ npu-smi info        # 复查确认显存/算力已释放
 
 验证基于模板脚本 [scripts/compare_precision.py](scripts/compare_precision.py)：agent 填 5 个函数（`build_model` / `build_sample` / `run_inference` / `output_type`，structured 输出另加 `custom_metric`）——`--mode baseline --runs ≥2` 采集基线并测自然波动 D_base，`--mode compare` 按输出类型计算度量、按校准公式定阈值并输出 `precision_report.json`（退出码非 0 = 未通过）。
 
+用户显式指定的测试数据/场景优先于默认样本选择（构造判据的优先级见 [01_preparation/SKILL.md](../01_preparation/SKILL.md)「一、测试数据准备」）；按指定场景验证的结论，表述限定在该场景内。
+
 ### 分级验证
 
 **Level 1 快速验证**（每次修改后）：
