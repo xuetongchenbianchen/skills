@@ -101,6 +101,39 @@ def is_device(e):
     return e.get("ph") == "X" and isinstance(e.get("args"), dict) and "Task Type" in e["args"]
 
 
+def _merge_intervals(intervals):
+    """合并重叠区间，返回已排序的 [(start, end)] 列表。"""
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
+
+
+def _intervals_total(merged) -> int:
+    return sum(end - start for start, end in merged)
+
+
+def _intervals_overlap(a, b) -> int:
+    """两个已合并区间列表的重叠总时长。"""
+    i = j = total = 0
+    while i < len(a) and j < len(b):
+        start = max(a[i][0], b[j][0])
+        end = min(a[i][1], b[j][1])
+        if end > start:
+            total += end - start
+        if a[i][1] <= b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
 def condense_stack(cs: str):
     """精简 call stack：保留 project frame（丢弃 site-packages / std 库），
     限制数量。返回 frame 字符串列表。若所有 frame 均为库 frame，则回退到顶部 frame。"""
@@ -213,6 +246,14 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
     dev_by_cid = defaultdict(list)        # cid -> [(dts_ns, ddur_ns, name, stream, task_type)]
     t2n_s = {}                            # async_npu flow id (== device_start_ns) -> torch host ts ns
     cpuop_timeline = []                   # (start_ns, end_ns, name, callstack)
+    # Host 开销分层（0b 节）：python_function 区间与 cpu_op 区间。
+    # Python/Module 机制层 = python 区间并集 − 与 cpu_op 区间并集的重叠
+    # （算子调用发生在 Python 帧内，扣除后剩余即纯 Python 机制时间）。
+    py_intervals = []                     # (start_ns, end_ns, (pid,tid))
+    op_intervals = []                     # (start_ns, end_ns, (pid,tid))
+    _PY_EXCLUDE = tuple(threshold("trace_view", "py_layer_exclude_markers",
+                        ["torch/profiler", "torch_npu/profiler", "torch/autograd/profiler",
+                         "torch/_dynamo"]))
     # C3: 用于 overlap + idle 归因的 compute-stream 区间（C2 v2 需要完整时间线）
     compute_intervals = []                # (start_ns, end_ns, stream_key)
     _CI_CAP = 2000000
@@ -304,6 +345,8 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
         elif cat == "cpu_op":
             if str(name).startswith("ProfilerStep"):
                 continue
+            ots = parse_ts_ns(e.get("ts"))
+            op_intervals.append((ots, ots + dur_ns(e.get("dur")), (e.get("pid"), e.get("tid"))))
             cs = e.get("args", {}).get("Call stack") if isinstance(e.get("args"), dict) else None
             if cs:
                 has_callstack = True
@@ -317,6 +360,11 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
                     heapq.heappush(host_prefetch, entry)
                 elif dn > host_prefetch[0][0]:
                     heapq.heapreplace(host_prefetch, entry)
+        elif cat == "python_function":
+            nm = str(name)
+            if not any(m in nm for m in _PY_EXCLUDE):
+                pts = parse_ts_ns(e.get("ts"))
+                py_intervals.append((pts, pts + dur_ns(e.get("dur")), (e.get("pid"), e.get("tid"))))
         elif ph == "X" and str(name).startswith("AscendCL@") and "ompile" in name:
             acl_compile[name] += 1
             acl_compile_dur += dur_ns(e.get("dur"))
@@ -397,6 +445,45 @@ def parse(csv_path: Path, top_k: int, gap_threshold_us: float) -> str:
         L.append("    仅有 host-device dispatch 时间线可用；源码映射需重新采集并开启 with_stack。")
     elif not has_callstack:
         L.append("  [!] 存在 cpu_op 但 Call stack 为空 (未开启 with_stack) — 仅 host op 耗时，无源码 stack。")
+    L.append("")
+
+    # --- 0b. Host 开销分层构成（Python/Module 层 vs 算子调用层）---
+    # 编译门槛判定输入：Python/Module 层显著 → jit.script/flat forward 等 eager 框架
+    # 手段先行；算子调用层主导 → 直接层次 3 图编译（jit.script 够不着 dispatch 链）。
+    if py_intervals or op_intervals:
+        L.append("## 0b. Host 开销分层构成 (Python/Module 层 vs 算子调用层)")
+        py_by_tid = defaultdict(list)
+        op_by_tid = defaultdict(list)
+        for start, end, key in py_intervals:
+            py_by_tid[key].append((start, end))
+        for start, end, key in op_intervals:
+            op_by_tid[key].append((start, end))
+        py_layer_ns = 0
+        for key, ivs in py_by_tid.items():
+            p = _merge_intervals(ivs)
+            c = _merge_intervals(op_by_tid.get(key, []))
+            py_layer_ns += _intervals_total(p) - _intervals_overlap(p, c)
+        op_layer_ns = sum(_intervals_total(_merge_intervals(ivs)) for ivs in op_by_tid.values())
+        host_total_ns = py_layer_ns + op_layer_ns
+        if host_total_ns > 0:
+            py_pct = py_layer_ns / host_total_ns * 100
+            op_pct = op_layer_ns / host_total_ns * 100
+            L.append("  host 开销落在哪一层决定 eager 框架手段与图编译的选择：")
+            L.append(f"  Python/Module 机制层: {py_layer_ns/1e6:>8.1f} ms ({py_pct:>5.1f}%)  — jit.script / flat forward 可达")
+            L.append(f"  算子调用层:          {op_layer_ns/1e6:>8.1f} ms ({op_pct:>5.1f}%)  — aten→aclnn dispatch 链，仅层次 3 图编译可达")
+            L.append("  算子调用层内部构成（alloc/metadata vs dispatch vs aclnn）见 operator_details 按类拆解")
+            _py_sig = threshold("trace_view", "py_layer_significant_pct", 30)
+            if py_pct >= _py_sig:
+                L.append(f"  - [SIGNAL] host 开销分层: Python/Module 层 {py_pct:.0f}% / 算子调用层 {op_pct:.0f}% — "
+                         f"Python 层显著（≥{_py_sig}%）：jit.script / flat forward 等 eager 框架手段先行并测得终点，再决定编译")
+            else:
+                L.append(f"  - [SIGNAL] host 开销分层: Python/Module 层 {py_pct:.0f}% / 算子调用层 {op_pct:.0f}% — "
+                         f"算子调用层主导：eager 框架手段收益有限，编译门槛判定输入（见 03 compilation_tools）")
+    elif caps.get("cpu_op", 0):
+        L.append("## 0b. Host 开销分层构成 (Python/Module 层 vs 算子调用层)")
+        L.append("  [!] 未检测到 python_function 事件（未开启 with_stack）— 分层构成不可用，")
+        L.append("  需 L1 采集（CPU activity + with_stack=True）重新分析。")
+        L.append("")
     L.append("")
 
     # --- 1. Device 时间线（仅 compute stream；折叠非 compute）---

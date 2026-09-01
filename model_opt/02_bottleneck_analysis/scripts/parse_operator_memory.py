@@ -229,12 +229,11 @@ def parse(profiling_dir: str, rank=None, top_k: int = 20,
 
     if projected_peak_mb / hbm_mb > PARALLELISM_RATIO:
         lines.append(f"  [SIGNAL] 预估 peak ({projected_peak_mb/hbm_mb*100:.0f}% HBM) 在消除浪费后仍超过 {PARALLELISM_RATIO*100:.0f}%。")
-        lines.append("    - 可能需要 parallelism。需进行源码分析:")
-        lines.append("      1. 阅读 03_optimization/references/parallel_design.md 了解拆分原则")
-        lines.append("      2. 用 operator_details 的 Call Stack 在源码中定位大 tensor")
-        lines.append("      3. 从计算结构中识别可 shard 的维度")
-        lines.append("      4. 拆分后重新 profile 以验证")
-        lines.append("    - Profiling 仅用于触发；拆分策略由源码决定。")
+        lines.append("    - 可能需要多卡并行切分。切分分析见 07_parallel_splitting（analysis_workflow.md:什么在吃显存 → 切哪个维度 → 通信代价）:")
+        lines.append("      1. 用 operator_details 的 Call Stack 在源码中定位大 tensor")
+        lines.append("      2. 从计算结构中识别可 shard 的维度")
+        lines.append("      3. 拆分后重新 profile 以验证")
+        lines.append("    - Profiling 仅用于触发；切分方案由源码分析决定。")
     elif waste_at_peak_mb > 0:
         lines.append(f"  [DEFINITE] Peak 时的浪费 = {waste_at_peak_mb:,.0f}MB。 "
                      f"消除后的预估 peak: {projected_peak_mb/hbm_mb*100:.0f}% HBM — 在单卡容量范围内。")

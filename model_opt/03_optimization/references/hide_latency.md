@@ -19,9 +19,33 @@
 
 NPU 设备可以同时做 DMA 传输（通信）和 AI Core 计算。让通信在通信流执行，计算在默认流执行，两者物理并行。
 
+**多流的开启与使用**（torch_npu 与 CUDA 同构；跨流同步用 Event，与 CANN 官方多 Stream 调用流程一致）：
+
+```python
+import torch_npu  # NPU 环境必须先 import
+
+comm_stream = torch.npu.Stream()                # 1. 创建侧流（通信流）
+
+# 2. 声明依赖：通信流先等计算流把输入算完
+comm_stream.wait_stream(torch.npu.current_stream())
+
+# 3. 把通信提交到通信流——with 块内的 op 全部进入该流，host 立即返回
+with torch.npu.stream(comm_stream):
+    dist.all_reduce(t)
+
+# 4. 计算流要用通信结果前，等通信完成（Event 同步）
+event = torch.npu.Event()
+event.record(comm_stream)
+torch.npu.current_stream().wait_event(event)
+```
+
+语义要点：同一流内严格串行（FIFO），不同流之间**默认互不等待**——重叠完全靠显式的 `wait_stream` / `wait_event` 声明依赖，漏声明 = 数据竞争。
+
 **寻找可重叠对**：对每个通信操作，问"在等待通信完成的这段时间内，有没有不依赖通信结果的计算可以做？"典型模式：通信的数据和计算 B 的输入来自不同上游 → 可重叠；通信发出后、结果被使用前，存在其他独立计算 → 将通信提前发出。
 
 **约束**：启动 comm_stream 前必须 `wait_stream` 确保输入就绪；同一 communicator 的两个集合操作不能在不同流并发（跨 rank 顺序不一致）；`all_to_all_single` 不支持 `async_op`，同步不可消除。
+
+**现成工具**：上述步骤 2-4 已封装为 [07_parallel_splitting/scripts/comm_recipes.py](../../07_parallel_splitting/scripts/comm_recipes.py) 的 `issue_on_comm_stream`（传入第 3 步 with 块内的通信函数，返回 Event）/ `wait_comm`（第 4 步），按需取用（copy 进项目后 import 行改为项目模块路径）。
 
 ### 双 buffer 流水线
 
@@ -38,3 +62,5 @@ NPU 设备可以同时做 DMA 传输（通信）和 AI Core 计算。让通信�
 ## 环境配置
 
 `TASK_QUEUE_ENABLE=2` 使 Host 下发和 Device 执行在时间上重叠，是异步流水线的基础。注意：`ASCEND_LAUNCH_BLOCKING=1` 时 task_queue 关闭不生效；可能导致 NPU 内存峰值上升，遇 OOM 可回退到 `=1`。
+
+多流重叠场景配套 `MULTI_STREAM_MEMORY_REUSE=1`：让通信流的内存块提前释放、供计算流复用——多流各自持有内存池是多流的主要额外显存来源（官方优化建议）。

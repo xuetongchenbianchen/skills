@@ -2,6 +2,51 @@
 
 Profiling 采集、精度对比等操作必须遵循统一的规范，确保每次执行的环境和流程一致。agent 应根据具体项目编写或修改脚本，但必须满足以下约束。
 
+## 标准项目目录结构
+
+全流程统一的项目目录布局，Phase 0 项目初始化时建立（见 [00_adaptation/SKILL.md](../00_adaptation/SKILL.md) 0.1），后续所有 Phase 的产出都落在这个结构里：
+
+```
+<project>/
+├── set_env.sh              # 一键环境启动（主目录）
+├── run_inference.py        # 推理入口（主目录）
+├── weights/                # 模型权重与配置（不提交）
+├── scripts/                # 模型相关脚本：精度验证、benchmark、profiling 采集等（提交）
+├── analysis/               # Phase 2 分析产物：round_{N}/ 子目录存放 Line A/Line B 报告与合并候选清单（提交）
+├── profiling/              # profiling 采集输出（不提交）
+├── golden/                 # 迁移前 golden 输出（Phase 0 适配精度对齐，不提交）
+├── baseline/               # 优化前 baseline 输出（Phase 1 优化回归，不提交）
+├── comparison_records/     # 精度对比结果留存（提交，提交门禁证据）
+└── evidence_db/            # 优化案例记录（提交）
+```
+
+- git clone 下来的模型库按此结构重组：已有脚本归入 `scripts/`，权重移动或软链到 `weights/`，推理入口保持在主目录
+- 提交范围按目录决定：源代码与结论性记录（`scripts/`、`analysis/`、`evidence_db/`、`comparison_records/`）提交；原始大体积数据（`weights/`、`profiling/`、`golden/`、`baseline/`）不提交
+
+`.gitignore`：
+
+```gitignore
+# 原始大体积数据（目录级忽略）
+weights/
+profiling/
+golden/
+baseline/
+
+# 运行时临时文件
+__pycache__/
+*.pyc
+kernel_meta/
+*.log
+.venv/
+```
+
+## 运行前 NPU 资源检查规范
+
+1. **强制检查**：每次运行代码（benchmark / profiling / 精度验证 / 功能测试）前，必须先用 `npu-smi info` 检查各卡上的进程占用
+2. **确认归属**：发现进程后，先用 `ps -fp <PID>` 确认进程身份；仅清理确认与当前任务无关的进程，疑似他人任务时必须先向用户确认
+3. **清理后复查**：`kill <PID>`（顽固进程用 `kill -9`）后再次 `npu-smi info`，确认显存/算力已释放，再启动运行
+4. **理由**：无关进程争抢算力/显存会导致性能数据失真（utilization、端到端时间被污染）或 OOM，基线数据一旦污染不可复用
+
 ## Profiling 采集规范
 
 1. **环境变量**：采集脚本中必须在 `import torch_npu` 之前设置：

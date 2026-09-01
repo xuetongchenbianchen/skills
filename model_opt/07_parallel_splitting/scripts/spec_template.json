@@ -1,0 +1,13 @@
+{
+  "dims": {"b": 1, "s": 4096, "h": 4096, "L": 32, "L_moe": 0},
+  "extra_flops": 8.8e12,
+  "bytes": {"param": 2, "act": 2},
+  "states": {"param": 1.4e10, "state": 6.0e9, "act": 1.2e9, "act_intra": 6.0e8,
+             "overhead": 2.0e9, "replicated_param_bytes": 0},
+  "hardware": {"hbm": 6.4e10, "alpha_us": 20, "bandwidth_GBs": 392},
+  "candidates": [
+    {"tp": 1, "pp": 1, "sp": 1, "cp": 1, "ep": 1},
+    {"tp": 2, "pp": 1, "sp": 1, "cp": 1, "ep": 1},
+    {"tp": 1, "pp": 1, "sp": 1, "cp": 2, "ep": 1}
+  ]
+}

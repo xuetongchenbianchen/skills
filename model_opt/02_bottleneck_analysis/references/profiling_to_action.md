@@ -1,9 +1,6 @@
 # Line B 分析路线：从现象到源码根因
 
-> 方法论脊柱：**现象 → 归因 → 源码定位**。
-> 下界分析（[bound_analysis.md](../../references/bound_analysis.md)）是 Phase 2 前置步骤，为此处瓶颈定位提供优化空间估算。下界分析回答"还有多少空间"，本文件回答"空间在哪、怎么缩小"。
-
-## 方法论脊柱
+> 方法论脊柱：**现象 → 归因 → 源码定位**。本文件只讲 Line B 自身的主分析（消费 profiling 数据定位到源码根因）；与 Line A 的联合分析（候选合并与量化、断桥回补）见 [merge_analysis.md](merge_analysis.md)。
 
 ```
 现象层  观察到什么（表象 + 瓶颈类型）
@@ -13,9 +10,11 @@
 源码层  源码中的具体位置 + 根因分析
 ```
 
-定位到根因后，产出候选清单（问题 + 位置 + 影响范围 + 反事实收益上限），进入 ★A 用户确认。候选收益评估方法见本文 §候选评估。优化维度选择和手段设计是 Phase 3 的工作。
+> 脚本已自动完成异常定位（Top-N 排序、DEFINITE/SIGNAL 信号、Suspect Kernels），agent 直接以脚本输出的显著信号为起点，不需要自行"找离群"。
 
-### 1. 现象层：观察到什么
+> 推理纪律：**纵向不跳层**——沿脊柱逐层推进，先确认"确实是这个算子的问题"再深入下一层；**横向多源互证**——单信号判断模糊时（如利用率 50% 难判 host/device）从多个文件/维度交叉验证收敛，真问题会在多维度同时留痕（典型：L0 vs L1 交叉验证分离 profiler 注入开销、GPU vs NPU 跨平台对比定位差距环节）。
+
+## 1. 现象层：观察到什么
 
 只回答"看起来是什么问题"，不回答为什么。从 profiling 读出表象并判定瓶颈类型：
 
@@ -27,99 +26,66 @@
 
 瓶颈类型决定归因层往哪个方向查（Host-Bound 查 host 侧浪费、Compute-Bound 查 compute 饱和…）。判定用利用率/硬件占比/通信占比，具体阈值是负载相关默认值（见工具映射层），非普适判据。
 
-### 2. 归因层：属于哪类浪费
+## 2. 归因层：属于哪类浪费
 
-把"慢"归到一类可消除的浪费。每类给**识别信号（概念）+ 量化上限（概念）**——上限是该类浪费占总时间的比例，是收益的理论天花板。候选排序见 §候选评估。
+把"慢"归到一类可消除的浪费。**十类浪费的定义与收益上限见 [waste_taxonomy.md](waste_taxonomy.md)（跨线统一分类）**；本节按类别给出 Line B 侧的识别信号（profiling 现象）与典型场景。
 
-1. **显式同步开销**——host 主动等 device（.item/.numpy/显式 sync/empty_cache）。信号：host 侧出现 D→H 同步类操作且占比高。上限：同步类 host 时间占比。典型：HuggingFace Trainer 每步 grad clip/NaN check 调 .item()。
-2. **dispatch/调度开销**——host 在框架调度（Module.__call__、hook、分发）而非计算。信号：host dispatch 时间占比高、设备 idle 但 host 在框架层忙碌。上限：dispatch 类 host 时间 / dispatch 延迟占比。
-3. **内存管理阻塞**——host 卡在内存管理 API（分配/释放/映射）。信号：内存管理类 host 时间占比高、高频分配释放。上限：内存管理类 host 时间占比。
-4. **在线编译/重编译**——每步重新编译算子。信号：编译事件贯穿全程（非仅预热期）。上限：编译时间占比。
-5. **内存带宽受限**——kernel 在搬数据而非算。信号：mte 占比远大于 mac、带宽利用率接近峰值。上限：带宽受限段的 device 时间。
-6. **compute 饱和**——计算密集且硬件已充分利用。信号：mac 高 + 并行度满 + 利用率高。上限：该 kernel 群 device 时间（且总可优化空间 <10% 时此类别为主）。
-7. **布局/格式转换**——运行时 transpose/cast/format 转换。信号：非 ND 格式占比高 / Transpose·Cast 类耗时多。上限：数据搬运类耗时占比。
-8. **通信同步等待**——通信时间花在等而非传。信号：通信 Wait 占比高。上限：通信等待时间。
-9. **小算子碎片**——大量短 kernel 串行。信号：短 kernel 占比高、kernel 数极多。上限：碎片段累计耗时。
-10. **延迟未掩盖**——存在可并行的独立工作但未重叠。信号：device idle 但有可并行计算、多流并发占比低。上限：可掩盖的 idle/延迟。
+1. **① 显式同步开销**——信号：host 侧出现 D→H 同步类操作且占比高。典型：HuggingFace Trainer 每步 grad clip/NaN check 调 .item()
+2. **② dispatch/调度开销**——信号：host dispatch 时间占比高、设备 idle 但 host 在框架层忙碌。归因时**必须产出分层构成**（数据来源：trace_view §0b Host 开销分层 + operator_details 按 Category 拆解），它是 03 编译门槛与工具选择的判定输入：
+   - **②a Python/Module 机制层**（Module.__call__ / hook / __getattr__ / 解释器）——jit.script、flat forward 等 eager 手段可达
+   - **②b aten dispatch 链**（aten::op → aclnnXxx 的逐算子调度，含 metadata op）——仅层次 3 图编译可达
+   - **②c aclnn tiling/launch**（CANN host 侧参数计算与下发）——仅层次 3 图编译可达
+   - 判定：②a 占比显著（如 ≥30%）→ eager 框架手段先行并测得终点再决定编译；②b/②c 主导 → eager 框架手段收益有限，直接评估图编译
+3. **③ 内存管理阻塞**——信号：内存管理类 host 时间占比高、高频分配释放
+4. **④ 在线编译/重编译**——信号：编译事件贯穿全程（非仅预热期）
+5. **⑤ 内存带宽受限**——信号：mte 占比远大于 mac、带宽利用率接近峰值
+6. **⑥ compute 饱和**——信号：mac 高 + 并行度满 + 利用率高（总可优化空间 <10% 时此类别为主）
+7. **⑦ 布局/格式转换**——信号：非 ND 格式占比高 / Transpose·Cast 类耗时多
+8. **⑧ 通信开销**——信号：通信 Wait 占比高，或 Transit 主导但带宽低于同 size 档基准。细分（判读规则与判定工具见 [profiling_scripts_guide.md](profiling_scripts_guide.md) §parse_communication，脚本输出自带提示）：
+   - **等待型**——某 rank 计算侧慢导致其余 rank 等（straggler）；或同步点/barrier 过频
+   - **冗余型**——同一张量被重复通信（短时间多次 AllGather、AG 结果大量丢弃）
+   - **串行型**——通信可与独立计算重叠但调度串行；无独立计算则为依赖性串行，不可掩盖
+   - **原语不当型**——集合通信原语选错（AllGather 收全量但只读 1/P）
+   - **策略性**——通信量由分片策略本质决定（如收缩维度=分片维度），修法是重新分片而非加速通信
+   - **拓扑错配型**——跨节点通信逻辑上可调整到节点内
+   - **协议开销型**——消息被固定延迟主导（小包），修法是合并通信
+
+   > 触发阈值：comm 列占总 step 时间 > 20%，或设备利用率 < 50% 且 comm 列有值，或多卡 wall-clock 加速比远低于理论。慢链路 / RDMA 重传疑似属环境侧问题——产出环境报告候选，不进代码优化候选。
+9. **⑨ 小算子碎片**——信号：短 kernel 占比高、kernel 数极多
+10. **⑩ 延迟未掩盖**——信号：device idle 但有可并行计算、多流并发占比低
 
 ### 当信号不匹配以上任何类别时
 
 在 operator_details 中发现高 host self time 但不在上述 10 类的识别信号中时，按以下路径推理归因：
 
 1. 用 `--filter <op_name>` 查看 call stack，判断是框架内部操作还是业务代码
-2. 若是框架内部操作（TorchScript 函数名、aten:: 前缀、框架容器索引等）→ 归因到"dispatch/调度开销"（第 2 类）
-3. 若是业务代码 → 检查是否属于框架调用链开销（Module.__call__、__getattr__），归因到"dispatch/调度开销"（第 2 类）
+2. 若是框架内部操作（TorchScript 函数名、aten:: 前缀、框架容器索引等）→ 归因到"dispatch/调度开销"（第 2 类），并按 ②a/②b/②c 细分到子层
+3. 若是业务代码 → 检查是否属于框架调用链开销（Module.__call__、__getattr__），归因到"dispatch/调度开销"（第 2 类）的 ②a 子层
 4. 若 device time 为 0 且不属于以上 → 检查是否为内存/元数据操作被错误归类，归因到"内存管理阻塞"（第 3 类）
 
-## 分析模式（推理方法）
+## 3. 源码定位
 
-归因层推理用的思维工具。脚本给数据和疑点，从疑点到决策需要推理——不是套固定 pattern，而是用以下两种模式自行构造。
-
-> 脚本已自动完成异常定位（Top-N 排序、DEFINITE/SIGNAL 信号、Suspect Kernels），agent 直接以脚本输出的显著信号为起点，不需要自行"找离群"。
-
-### 模式 1：横向关联（广度结合）
-
-同一问题从多个文件/维度交叉验证收敛。目的：消除单信号歧义，多来源指向同方向才可信。何时用：单脚本判断模糊（如利用率 50% 难判 host/device）、L0 vs L1 交叉验证（分离 profiler 注入开销）、跨平台对比（GPU vs NPU 定位差距环节）时。关键：真问题会在多维度同时留痕。
-
-### 模式 2：纵向深入（沿一个点逐层钻入到源码）
-
-从高层信号层层钻到源码行级根因，是定位瓶颈的主线模式。典型路径：op_statistic（哪类算子最耗时）→ kernel_details --filter（为什么慢）→ operator_details --filter（谁触发）→ 源码（为什么这样写）。关键：不跳层，先确认"确实是这个算子的问题"再深入。Call Stack 断桥（"(no stack)"）时，用 Input Shapes 反推计算语义，或切换到 Line A 穿透框架层。
-
-模式 1 是模式 2 的补充——当模式 2 单线钻入的结论有歧义时，用模式 1 从其他维度交叉验证。简单问题模式 2 即可定位，复杂问题在 1↔2 间反复。
-
-## 源码定位
-
-> 归因层确定了"属于哪类浪费"后，需要从 profiling 数据跨接到源码具体位置——这是方法论脊柱的第三层（源码层）。
-
-Profiling 只能告诉你"哪个算子慢"，要动手优化必须先把它跨接到"源码里哪一行/哪个模块"。这一跨接依赖 profiling 文件里几个特定字段作为"桥"。
-
-> 前提：这些桥全部依赖采集参数正确。若采集缺失对应开关，字段不会生成，桥即断裂——此时不能假装能精确定位，只能按降级路径做有限推断。采集参数见 [profiling_collection.md](../../01_preparation/references/profiling_collection.md)。
+Profiling 只能告诉你"哪个算子慢"，要动手优化必须先跨接到"源码里哪一行"。跨接依赖以下字段作"桥"——**桥全部依赖采集参数**：缺对应开关则字段不生成、桥即断裂，只能按降级路径做有限推断（采集参数见 [profiling_collection.md](../../01_preparation/references/profiling_collection.md)）。
 
 ### 桥接工具
 
 | 桥 | 字段 / 文件 | 采集前提 | 作用 |
 |----|------------|---------|------|
-| **Call Stack** | `operator_details.csv` 的 `Call Stack` 列 | `activities` 含 CPU + `with_stack=True` | 唯一能把一次算子调用映射到 Python 源码函数/行号的字段 |
-| **Input Shapes** | `kernel_details.csv` / `operator_details.csv` 的 `Input Shapes` 列 | `record_shapes=True` | 区分同一算子类型的不同调用点；Call Stack 断桥时，可从 shapes 反推计算语义（如 one-hot 向量 × 权重 = gather） |
-| **下发时序** | `trace_view.json` 的 HostToDevice flow、`Node@launch` 的 `connection_id`、`async_npu(torch_to_npu)` flow、`AscendCL@opCompile` 事件（`parse_trace_view.py`） | NPU 采集即有；Python 调用栈/源码映射需 `with_stack=True` | host→device 下发链与在线编译停顿（A 预热 / B 每步）。`async_npu` flow 本身携带 `cpu_op` 的 Call Stack，因此下发时序是包含 Call Stack + host-device 时序关系的 richer 数据源——适合 host-device 交互类问题（如设备空等、下发延迟），而非"某个慢算子"类问题。**NPU 推理场景注意**：异步流水线（TASK_QUEUE_ENABLE=2）下 host-device 时序 gap 可能是 profiler 伪影，需先用 L0 交叉验证确认 gap 真实性再做因果推断 |
+| **Call Stack** | `operator_details.csv` 的 `Call Stack` 列 | CPU activity + `with_stack=True` | 算子调用 → Python 源码行号（唯一直接映射） |
+| **通信算子 Call Stack** | `Hccl*` 行/事件，经 `parse_communication.py --trace-source` 对齐回链 | 同上 | hcom 通信算子无直接行，经 host 侧 `Hccl*` 记录回链到调用源码 |
+| **Input Shapes** | `kernel_details.csv` / `operator_details.csv` 的 `Input Shapes` 列 | `record_shapes=True` | 区分同一算子的不同调用点；断桥时反推计算语义 |
+| **下发时序** | `trace_view.json` 的 flow / `connection_id` / `opCompile` 事件（`parse_trace_view.py`） | NPU 采集即有（源码映射另需 `with_stack`） | 下发链与编译停顿；自带 Call Stack，适合设备空等/下发延迟类问题 |
 
 ### 定位路径
 
-定位的入口取决于问题类型：
+- **设备侧问题**（某算子慢）：脚本信号 → `--filter` 该算子 → Call Stack 定位源码行；同一算子多调用点用 Input Shapes 区分。
+- **host-device 交互问题**（设备空闲/下发延迟/编译停顿）：信号来自 step_trace（Free 大）与 trace_view（Bound Regions / idle 成因）；入口用**下发时序**——`connection_id` 配对定位"设备在等哪个 host 操作"，再从该 host 操作的 Call Stack 落到源码。
 
-**设备侧问题**（某算子慢/开销高）：脚本信号（op_statistic / kernel_details 发现异常算子）→ `--filter` 获取该算子的 Call Stack（来自 `operator_details.csv`）→ Call Stack 有源码信息？
+**通用规则**：
+- **断桥**（"(no stack)"，框架 codegen 算子）：先 Input Shapes 反推语义；反推不出移交合并阶段（[merge_analysis.md](merge_analysis.md)「断桥与回补」）
+- **伪影验证**：异步流水线（TASK_QUEUE_ENABLE=2）下 host-device gap 可能是 profiler 伪影，先 L0 交叉验证再作因果推断
 
-- **有源码**（正常情况）：直接定位到函数/行号。如需区分同一算子类型的多个调用点，再用 Input Shapes 确认是哪种 shape。产出候选。
-- **"(no stack)"**（框架动态生成的算子，如 JIT/e3nn codegen/opt_einsum_fx）：用 **Input Shapes** 反推计算语义（如 `(72,1)×(72,1)` = one-hot 向量 × 权重 = gather），推断出操作的实际含义后，切换到 **Line A 穿透框架层**：沿算子类型 → 框架入口 → 代码生成逻辑 → 生成出的算子序列，追溯该算子是哪段框架代码生成的。结论标注为"Line A 推断"。详见 [proactive_source_analysis.md](proactive_source_analysis.md)
-
-**host-device 交互问题**（设备空闲 / 下发延迟 / 在线编译停顿）：
-- 信号来源：step_trace（Free 大 / 利用率低）、trace_view（Host2Device Bound Regions、idle 成因分解）
-- 入口：直接用**下发时序**（来自 `trace_view.json`，经 `parse_trace_view.py` 解析）。`async_npu` flow 本身携带 host 操作的 Call Stack——下发时序同时提供"哪个 host 操作在下发"和"设备在等什么"
-- `connection_id` 配对 `Node@launch`↔设备算子，定位"设备空等 host"的时间区段和对应的 host 操作 → 从该 host 操作的 Call Stack 定位源码
-- **Call Stack 断桥**（host 操作也无 "(no stack)"）：同设备侧路径，用 Input Shapes 反推或切换 Line A 穿透框架层
-- **NPU 推理场景注意**：需先用 L0 交叉验证确认 host-device gap 非 profiler 伪影
-
-例：`op_statistic` 发现 Transpose 占 15% → `operator_details --filter Transpose` 用 **Call Stack** 定位到源码行 → `kernel_details --filter Transpose` 用 **Input Shapes** 确认是哪种 shape → 产出候选（问题 + 位置 + 影响范围）。
-
-## 候选评估：反事实收益上限
-
-定位到根因后产出候选清单。候选排序不应基于 profiling 中的 self-time 占比（"时间花在哪"），而应基于**反事实收益上限**（"消除此浪费后端到端最多改善多少"）。self-time 占比 ≠ 优化收益——被异步流水线重叠的 host 开销虽然占比高，但消除它对端到端几乎无影响。
-
-### 估算方法
-
-对每个候选，在实施前估算反事实收益上限：
-
-1. **确定该候选消除的浪费量**：
-   - 设备侧浪费（如冗余 Transpose/Cast 占 L0_Computing 的比例）→ 消除量 = 该类算子的 L0_Computing 占比
-   - host 侧浪费（如 dispatch 开销）→ 消除量 ≤ L0 Free（不能超过 device 空闲时间）
-
-2. **Amdahl 约束**：若消除量为 p（占总时间比例），端到端加速上限 = 1/(1−p)。但实际收益取决于该浪费是否在关键路径上。
-
-3. **异步流水线修正**：
-   - 若消除的是设备侧浪费（冗余算子）→ 不受异步流水线影响，实际收益 ≈ self-time 占比
-   - 若消除的是 host 侧浪费 → 大部分可能已被重叠，实际收益 << self-time 占比，以 L0 Free 为上界
-
-4. **标注反事实收益上限**：每条候选标注"反事实收益上限"（而非 self-time 占比），按此降序排列。
+例：`op_statistic` 发现 Transpose 占 15% → `operator_details --filter Transpose` 用 Call Stack 定位源码行 → `kernel_details --filter` 用 Input Shapes 确认调用点 → 产出根因追踪记录。
 
 ## 脚本信息不够时的深入方法
 

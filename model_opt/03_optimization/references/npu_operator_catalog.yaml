@@ -89,12 +89,12 @@ operators:
     pattern: "Attention (QK^T + bias + softmax + V)"
     constraints:
       - "eager 模式支持 fp32；GE 图模式仅 fp16/bf16"
-      - "与 torch.compile 图模式不兼容 (multi-stream)，需用 FIA 替代"
+      - "torchair GE 图编译可用性随 layout 与版本变化（torch_npu 2.6.0.post5 实测）：BSH/BNSD 可整图编译且 dynamo 可完整 trace（含 fp32）；BSND 触发 fx→ge converter NotImplementedError——遇 converter 报错先换 layout 再换算子"
       - "pre_tockens / next_tockens 是 CANN 官方拼写 (非 pre_tokens)"
       - "pse (position bias) dtype 必须与 query 一致，不一致时静默产生错误结果"
       - "返回 7 个值，推理只用第 1 个，用 *_ 丢弃"
       - "Fallback 场景: KV cache / cross-attention / output_attentions / head pruning"
-      - "input_layout 支持: BSH / SBH / BSND / BNSD / TND"
+      - "input_layout 支持: BSH / SBH / BSND / BNSD / TND；TND 需同时传 actual_seq_qlen/actual_seq_kvlen"
 
   - name: npu_fusion_attention_v2
     signature: "attn_output, *_ = torch_npu.npu_fusion_attention_v2(query, key, value, head_num, input_layout, *, pse=, padding_mask=, atten_mask=, query_rope=, key_rope=, scale=1., keep_prob=1., pre_tokens=, next_tokens=, ...)"
@@ -154,14 +154,14 @@ operators:
       - "支持 Atlas 训练/A2/A3/推理系列"
 
   - name: npu_linear
-    signature: "output = torch_npu.npu_linear(input_2d, weight)"
+    signature: "output = torch_npu.npu_linear(input_2d, weight) | torch.ops.npu.npu_linear(input_2d, weight, bias)"
     dtypes: [fp16, bf16, fp32]
     replaces: "F.linear (含内部 weight.t())"
-    pattern: "Linear 无 bias"
+    pattern: "Linear（可选 bias 融合）"
     constraints:
       - "仅支持 2D 输入，3D+ 需 view(-1, dim) 再调用"
-      - "不支持 bias"
       - "内部自动做 weight 转置，不需要手动 .t()"
+      - "bias 仅 torch.ops.npu.npu_linear 三参形式支持；经 torchair converter 融合进 GEMM epilogue（fp32 同样生效——fp32 下 aten::addmm converter 反而不融合 bias）"
 
   - name: npu_mish
     signature: "output = torch_npu.npu_mish(input)"
@@ -223,3 +223,4 @@ cross_operator_pitfalls:
   - "多数融合算子返回多值，统一用 result, *_ = 解包更安全"
   - "npu_silu 和 npu_layer_norm_eval 计划废弃，建议用 torch.nn.functional 中的等价接口替换"
   - "npu_fast_gelu 与 npu_gelu 计算公式不同（近似公式不同），精度可能有差异，不能随意互换"
+  - "torch.nn.functional.gelu 的 approximate 参数在 NPU 上被忽略（torch_npu 2.6.0.post5 实测 'tanh' 与 'none' 输出一致；torchair converter 同样丢弃）；需控制 GELU 变体时用 npu_gelu(approximate=)"

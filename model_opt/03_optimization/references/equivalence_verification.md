@@ -5,7 +5,7 @@
 每次对模型推理路径做**等价替换**（换 API、换融合算子、换算法）后，必须验证替换前后计算等价。本文定义单步即时验证流程——比较替换前后的 tensor 输出，确认数值一致。
 
 > 等价性验证是所有优化的前提约束——不通过验证的改动不允许进入后续流程。
-> 本文关注单步等价（tensor 级数值对比）。下游功能指标（benchmark 分数、LPIPS、RMSD 等）的验证见 SKILL.md Level 2 全量验证。
+> 本文关注单步等价（tensor 级数值对比）。下游功能指标（benchmark 分数、LPIPS、RMSD 等）的验证见 [04_accuracy_assurance/SKILL.md](../../04_accuracy_assurance/SKILL.md) Level 2 全量验证。
 
 ## 验证步骤
 

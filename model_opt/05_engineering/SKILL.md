@@ -7,11 +7,9 @@ description: 工程化实践：目录规划、版本管理、文档维护。当�
 
 ## 工程目录规划
 
-### 原则
-- 目录命名按功能语义（scripts/、profiling/、accuracy/、evidence_db/ 等），具体结构由项目决定
+- 目录结构遵循标准项目目录结构（[standardized_operations.md](../references/standardized_operations.md)——Phase 0 初始化，含 `analysis/` 轮次目录），本节不另设口径
 - profiling 输出带时间戳 + `latest` 软链接，防覆盖且方便引用
-- `.gitignore` 覆盖大文件（模型权重、profiling trace），详见 [templates/gitignore_template.md](templates/gitignore_template.md)
-- 应当纳入 git 的：源代码、脚本、文档、对比结果的摘要（非原始大文件）
+- `.gitignore` 覆盖大文件（模型权重、profiling trace），详见 [templates/gitignore_template.md](templates/gitignore_template.md)；提交范围（`scripts/`、`analysis/`、`evidence_db/`、`comparison_records/`）以标准结构定义为准
 
 ## Git 版本管理
 
@@ -57,6 +55,7 @@ git commit 前，**必须**向用户展示本批总结并使用 `ask_user_questi
    - 性能数据对比（优化前 vs 优化后，含数据来源）
    - 精度验证结果（指标 + 通过/未通过）
    - 修改的文件列表
+   - evidence_db 案例文件路径
    - 未采纳的方案及原因（如有）
 2. **询问用户**：
    - 是否确认提交本批优化

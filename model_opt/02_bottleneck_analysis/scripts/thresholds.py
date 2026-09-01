@@ -19,6 +19,9 @@ THRESHOLDS = {
         "step_util_variance": 20,           # % — max-min util difference across steps
         "step_duration_spread": 2.0,        # max/min ratio for step duration outlier
         "large_optimizable_space": 30,      # % — Free/Total above this = large optimizable space
+        "comm_overlap_excellent": 80,       # % — overlapped/comm above this = excellent overlap
+        "comm_overlap_moderate": 50,        # % — overlapped/comm above this = moderate overlap
+        "pipeline_effective_low": 70,       # % — pipeline effective ratio below this = low (bubble)
     },
 
     "op_statistic": {
@@ -32,6 +35,9 @@ THRESHOLDS = {
         "heavy_max_count": 10,              # count <= this = heavy single-invocation
         "heavy_min_avg_us": 100,            # us — avg above this = heavy
         "heavy_min_ratio": 0.01,            # total/total ratio above this = heavy
+        "variance_max_avg_ratio": 5.0,      # x — max/avg per-op duration above this = variance signal
+        "variance_min_total_ratio": 0.01,   # op total share below this = skip variance signal
+        "frag_min_total_ratio": 0.01,       # fragmentation op total share below this = skip signal
     },
 
     "kernel_details": {
@@ -55,6 +61,7 @@ THRESHOLDS = {
         "non_nd_format_ratio": 0.1,        # ratio — non-ND input format above this = layout conversion signal
         "filter_high_wait_multiplier": 3,  # x — wait > avg * this in filter mode = high-wait instance
         "filter_high_wait_min_us": 200,    # us — minimum wait for filter mode high-wait context
+        "fp32_ratio_signal": 0.5,          # ratio — fp32 kernel duration share above this = SIGNAL
     },
 
     "trace_view": {
@@ -133,13 +140,45 @@ THRESHOLDS = {
     },
 
     "communication": {
+        # --- 摘要与类型分解 ---
         "wait_dominant_ratio": 0.8,         # wait/total above this = DEFINITE sync-bound
         "per_type_wait_ratio": 0.9,         # per-type wait ratio above this = SIGNAL
         "per_type_min_count": 10,           # min count for per-type signal
-        "low_bw_ratio": 0.3,                # bandwidth below avg*this = low bandwidth link
-        "low_bw_min_size_mb": 1,            # MB — min size for low bandwidth link signal
-        "small_packet_mb": 1.0,             # MB — packets below this = small
-        "small_packet_ratio": 0.3,          # small packet ratio above this = SIGNAL
+        "small_packet_ratio": 0.3,          # 延迟主导消息占比超此 → [SIGNAL]（M2 小包判定）
+        # --- M1 溯源 ---
+        "trace_top_k": 3,                   # 默认报告自动溯源的算子数
+        "comm_host_op_map": {               # hcom → Hccl host 名映射（首选名在前；计数匹配者用于对齐）
+            "hcom_allGather": ["HcclAllGather", "HcclAllgatherBase"],
+            "hcom_allReduce": ["HcclAllReduce"],
+            "hcom_alltoall": ["HcclAllToAllV", "HcclAllToAll"],
+            "hcom_reduceScatter": ["HcclReduceScatterV", "HcclReduceScatter"],
+            "hcom_broadcast": ["HcclBroadcast"],
+            "hcom_send": ["HcomSend", "HcclSend"],
+            "hcom_recv": ["HcomRecv", "HcclRecv"],
+        },
+        "overlap_risk_ratio": 0.02,         # 同域时间区间重叠率超此 → 序号对齐标记不可靠
+        "host_ts_lag_tolerance_us": 1000,   # trace ts 校验容忍的时钟偏差
+        "suspect_min_elapse_ms": 100,       # Top op elapse 低于此不算疑点（溯源成本控制触发）
+        # --- M1 瞬态防护 ---
+        "head_wait_ratio": 0.6,             # 头部区段 wait 占比超此 → 疑瞬态污染
+        "head_window_frac": 0.1,            # 头部区段 = 通信总时窗前 10%
+        # --- M2 Matrix ---
+        "skew_ratio": 3.0,                  # rank-pair size 倾斜比
+        "skew_min_size_mb": 10,             # 倾斜检查排除的小消息
+        "slow_link_size_buckets": [1, 10, 100],  # size 对数分档边界（MB）
+        "bw_p50_ratio": 0.5,                # 大 size 档内低于 P50×此值 = 慢链路
+        "unaligned_link_ratio": 0.3,        # 非 512B 对齐 link 占比超此 → [SIGNAL]
+        "alignment_bytes": 512,             # HCCS 对齐要求
+        "rdma_retransmission_ms": 4000,     # Transit 超此 = 疑似重传
+        "latency_dominated_multiple": 3.0,  # transit < 此×L̂ = 延迟主导小包
+        "latency_est_min_samples": 10,      # 最小档样本低于此 → L̂ 不可信，降级分档下界缺省
+        "soc_bw_table": {},                 # 芯片带宽参考表（默认空 = 绝对基准不启用）
+        # --- M3 跨 Rank ---
+        "straggler_min_wait_gap": 0.5,      # 高 wait 算子上 max/min wait 超出 1+此值才投票
+        "r_wait_sort_top_k": 5,             # R_wait 画像排序展示条数（无阈值判定）
+        "overlap_severe_pct": 5,            # 假性重叠判定的重叠下限（触发以 Comm(NotOvl) 占比为准）
+        "false_overlap_comm_pct": 20,       # 假性重叠判定
+        "alltoall_cv_signal": 0.20,         # alltoall 量/kernel 耗时跨 rank CV（负载不均交叉验证）
     },
 
     "api_statistic": {

@@ -1,27 +1,18 @@
 # .gitignore 模板
 
-profiling trace 文件大、临时文件多，不应纳入 git。
+目录结构与提交范围的完整定义见 [standardized_operations.md](../../references/standardized_operations.md)「标准项目目录结构」，本模板与其保持一致。
 
 ```gitignore
-# Profiling 输出目录
+# 原始大体积数据（目录级忽略）
+weights/
 profiling/
-*.pb
-*.json.gz
-ASCEND_PROFILER_OUTPUT/
-PROF_*/
+golden/
+baseline/
 
 # 运行时临时文件
-*.log
-*.npy
-*.pt
 __pycache__/
 *.pyc
-output/
-
-# 模型权重（如有单独存储方案）
-weights/
-*.safetensors
-*.bin
+kernel_meta/
+*.log
+.venv/
 ```
-
-**应当纳入 git** 的：源代码、脚本、文档、对比结果的摘要（非原始大文件）。

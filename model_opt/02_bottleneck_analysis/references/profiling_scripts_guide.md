@@ -1,5 +1,12 @@
 # Profiling 解析脚本使用指南
 
+## 目录
+
+- [概述](#概述) / [脚本列表](#脚本列表)（11 个脚本 × 对应文件 × 用途速查）/ [通用调用方式](#通用调用方式)
+- 各脚本详细说明（按需查询单个脚本）：
+  [parse_op_statistic](#parse_op_statisticpy) / [parse_api_statistic](#parse_api_statisticpy) / [parse_step_trace](#parse_step_tracepy) / [parse_kernel_details](#parse_kernel_detailspy) / [parse_memory_record](#parse_memory_recordpy) / [parse_operator_details](#parse_operator_detailspy) / [parse_operator_memory](#parse_operator_memorypy) / [parse_trace_view](#parse_trace_viewpy) / [parse_communication](#parse_communicationpy) / [diff_profiling](#diff_profilingpy)
+- [注意事项](#注意事项)
+
 ## 概述
 
 本 skill 的 `scripts/` 目录（即 `02_bottleneck_analysis/scripts/`）下的脚本用于解析 CANN profiler 产出的 CSV 文件，将百万级原始数据压缩为结构化摘要，供 agent 消费后做优化决策。
@@ -19,9 +26,10 @@
 | `parse_memory_record.py` | `memory_record.csv` | ~30K-1M 行 | 内存时间线，峰值定位，OOM 预判 |
 | `parse_operator_details.py` | `operator_details.csv` | ~100K-20M 行 | 单算子耗时 + 完整调用栈（流式 Top-K） |
 | `parse_operator_memory.py` | `operator_memory.csv` | ~10K 行 | 内存分配热点 |
-| `parse_communication.py` | `communication.json` + `communication_matrix.json` | — | 多卡通信分析：时间分解、带宽、等待占比 |
+| `parse_communication.py` | `communication.json` + `communication_matrix.json`（+ `operator_details`/`trace_view` 溯源） | — | 多卡通信统一分析：M1 溯源、M2 Matrix 判读、M3 跨 Rank straggler 定位、M4 带宽自基准（多 rank 目录自动 `--all-ranks`） |
 | `parse_trace_view.py` | `trace_view.json` | 4MB-1GB+ | 时序：host→device 下发链、device 空隙、在线编译停顿、Call stack 源码栈 |
 | `diff_profiling.py` | 两份 profiling 目录 | — | 对比两次采集的算子耗时和内存变化 |
+| `line_a_report.py` | findings.yaml（agent 产出，非 profiling 文件） | — | Line A 报告渲染器：schema 校验（疑点须引用事实 id、三层事实非空）+ 热路径覆盖检查 + 落盘 `analysis/round_{N}/line_a_report.md`（详见 [proactive_source_analysis.md](proactive_source_analysis.md)「报告落盘」） |
 
 ## 通用调用方式
 
@@ -280,6 +288,7 @@ python parse_operator_memory.py /path/to/profiling --top-k 20
 
 **输出包含**：
 0. **Detected Layers**：探测到的各层事件数；若缺 cpu_op/Call stack，明确提示"需重采开启 with_stack"，不静默出空
+0b. **Host 开销分层构成**：`python_function` 区间并集扣除 `cpu_op` 重叠 = Python/Module 机制层，`cpu_op` 并集 = 算子调用层（aten→aclnn dispatch 链）。产出 [SIGNAL] 分层占比——**编译门槛判定输入**：Python 层显著（默认 ≥30%）→ jit.script/flat forward 等 eager 框架手段先行；算子调用层主导 → eager 框架手段收益有限，直接评估层次 3 图编译（见 03 compilation_tools「与四维度优化的顺序」）。需 with_stack=True 的 L1 数据，缺失时明确提示
 1. **Device Timeline**：只列含 compute 任务的 stream（span/active/busy%/kernel 数），其余通信/同步/DMA 流折叠成一行；compute 任务间的 gap 分布
 2. **Device Stalls**：≥ 阈值的空隙**按(前→后 kernel 对)聚合**，给出出现次数、累计 gap、平均、最大，按累计降序——反复出现且累计大的才值得优化，避免被大量个例淹没
 3. **Dispatch Latency**：HostToDevice flow 配对得到的下发延迟分布（avg/max/p50/p90）+ 最慢的 top-N（附最近 device kernel 名）
@@ -293,6 +302,7 @@ python parse_operator_memory.py /path/to/profiling --top-k 20
 
 **何时使用**：
 - step_trace 判定 host-bound 后，用它定位 host 侧到底在忙什么（下发 / 编译 / 同步）
+- **判定编译门槛**：§0b 的分层构成回答"eager 框架手段（jit.script/flat forward）还剩多少可做"——②a Python 层 vs ②b/②c 算子调用层的占比是 03 编译前置条件的测量依据
 - 定位 host2device bound 区段：第 4 节直接给出"哪段时间、哪段代码 host 喂不动设备"，配合 §3 全局下发延迟判断是局部还是系统性问题
 - 需要 host→device 下发链、区分首次编译（A 类，采集可解）与每步在线编译（B 类，执行模式问题）时
 - 找预取 / 预分配 / buffer 复用等**不换算子**的优化点，并用 Call stack 定位到源码
@@ -307,29 +317,43 @@ python parse_trace_view.py /path/to/profiling --filter aten::addmm
 
 ### parse_communication.py
 
-**输入**：`communication.json` + `communication_matrix.json`（多卡场景 profiler_level >= Level1 时产出）
+**输入**：`communication.json` + `communication_matrix.json`（多卡场景 profiler_level >= Level1 时产出）；溯源另需 `trace_view.json` 或 `operator_details.csv`（`with_stack=True` 采集）；跨 Rank 模式需多 rank 目录
 
-**定位**：通信分析工具。唯一能回答"通信为什么慢"的脚本——区分"真在传数据(Transit)"还是"在等其他 rank(Wait/Sync)"，以及带宽是否正常。
+**定位**：多卡通信统一分析入口。回答"通信为什么慢、谁在让谁等、哪条链路、哪行源码"。多 rank 目录时自动启用跨 Rank 对比（H7）。跨 rank 对比按 hcom 算子全名 join——名字中的 `@域ID` 后缀即分组依据，不同域的 rank 不共享同名算子，天然不会跨组误比，无需推断并行策略。
 
-**输出包含**：
-1. **Summary**：总通信时间分解（Transit/Wait/Sync/Idle）——一眼看出是带宽瓶颈还是同步瓶颈
-2. **By Op Type**：按通信算子类型（allGather/alltoall/allReduce）聚合，含 Wait% 和 Transit%
-3. **Top Ops by Elapse**：最耗时的通信算子排名
-3b. **P2P Ops**：send/recv 详细时序（原仅计数）——PP 推理 P2P 是通信主体时定位瓶颈；wait 占比高指向流水 bubble
-4. **Per-Link Bandwidth**：从 communication_matrix 提取的 per-link 带宽（min/avg/max + 最高/最低 link）
-5. **Suspect Signals**：
-   - [DEFINITE] Wait 占比 >80% → 同步瓶颈（非带宽问题），查通信-计算重叠 / straggler / 同步点
-   - [SIGNAL] 某类算子 Wait% >90% → 交叉验证 trace_view 看 compute-comm 重叠
-   - [SIGNAL] 低带宽 link（<30% 均值）→ 瓶颈 link
-   - [SIGNAL] 小包占比 >30% → 考虑 batch 减少 small-packet overhead
+**判读原则**（脚本输出自带提示，此处为完整规则）：
+- **等待还是带宽只用直接判据**：wait/transit 时间分解。R_wait（H7 M3.2）仅作画像/排序，不做阈值判定——单 rank 链路降级（transit 主导）同样推高 R_wait，间接判定会把带宽问题误判为等待；
+- **带宽是算法分摊值**：同 HCCS 上 allgather 链路可达 ~130GB/s 而 alltoall 链路仅 ~24GB/s（小 chunk 算法形态），任何绝对带宽阈值都会误报——一切带宽判断必须 size 条件化（H5 自基准）。
+
+**输出结构（H1–H7）**：
+- **H1 摘要**：总量分解（Transit/Wait/Sync/Idle）+ wait-dominant 判定 + step_trace 一致性检查 + wait 头部集中度（疑瞬态污染警示）+ 溯源方式与置信度 + 慢卡提示
+- **H2 按算子类型**：allGather/alltoall/allReduce 聚合，Wait%/Transit%
+- **H3 Top Ops by Elapse**：源码位置列（项目帧 + 置信度标记 + 头部位置标注）——仅疑点（elapse ≥ `suspect_min_elapse_ms` 且 wait 主导）自动溯源，其余用 `--trace-source` 按需深挖
+- **H4 P2P Ops**：send/recv 时序（wait 占比高指向流水 bubble）
+- **H5 Matrix 深度分析**：rank-pair 倾斜（同 transport 内、排除小消息、按类型解读）/ transport 合理性（只用数据内证据，不断言拓扑）/ 慢链路（size 分档带宽自基准，仅大 size 档）/ 链路矩阵渲染 / 组↔算子回链 / 字节对齐（512B）/ RDMA 重传疑似 / 延迟主导小包（L̂ = 最小档 transit P50 数据内估计，transit < 3×L̂ 判定；样本不足降级 1MB 缺省）
+- **H6 可疑信号汇总**
+- **H7 跨 Rank 对比**（多 rank 目录自动）：M3.1 per-op wait join——hcom 全名跨 rank join，**wait 最小的 rank = straggler** [DEFINITE]，引导对它跑单卡脚本（`--rank N`）查计算侧；M3.2 per-rank 汇总（R_wait 仅画像排序，无阈值判定）；M3.3 重叠对比（触发以 Comm(NotOvl) 占比 >20% 为准，归因二分：串行型可掩盖 / 依赖性串行不可掩盖）；alltoall 负载不均判读（量 CV × M2 倾斜互证）
+
+**溯源置信度标记**（溯源错一行会带偏整个根因分析，宁可降级不硬对）：
+- `[ALIGNED·trace]`：trace ts 对齐，自校验通过（host_ts ≤ device_start）
+- `[RISKY·csv]`：operator_details 文件序对齐（无时间戳自证，域内重叠率 <2% 才启用）
+- `[AGGREGATED]`：对齐不可靠，降级输出聚合栈分布
 
 **何时使用**：
-- step_trace 显示 Communication 占比高时
-- 多卡场景排查 straggler（某 rank 慢导致其他 rank 等待）
-- 通信-计算重叠分析（配合 trace_view）
+- step_trace Communication 占比高、或设备利用率低且 comm 有值时
+- 多卡场景排查 straggler / 负载不均 / 通信链路
+- 通信疑点需要定位到调用通信的 Python 源码位置时
 
 ```bash
+# 单 rank 分析（多 rank 目录时自动含 H7 跨 Rank 对比）
 python parse_communication.py /path/to/profiling --rank 0 --top-k 15
+
+# 单算子深挖溯源（输出完整调用栈）
+python parse_communication.py /path/to/profiling --rank 0 \
+    --trace-source "hcom_allGather__612_546_1@5862276093215481612"
+
+# 跳过 trace 扫描（只用 CSV 序号对齐，省 1.3GB 扫描成本）
+python parse_communication.py /path/to/profiling --rank 0 --no-trace
 ```
 
 ---
@@ -359,7 +383,7 @@ python diff_profiling.py /path/to/before /path/to/after --top-k 20
 
 ## 注意事项
 
-- `run_analysis.py` 生成两段式报告：**总章**（全局优化空间 + 信号清单，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组，首读只需看此章）+ **细节章**（A~H 节完整 statistics，供下钻参考）。信号标记说明在总章声明一次
+- `run_analysis.py` 生成两段式报告：**总章**（全局优化空间 + 信号清单，按 [DEFINITE]/[SIGNAL]/[FUTURE] 分组，首读只需看此章）+ **细节章**（A~H 节完整 statistics，供下钻参考；H 节仅多卡场景出现）。信号标记说明在总章声明一次
 - 所有脚本都输出 signal 行（`[DEFINITE]`/`[SIGNAL]`/`[FUTURE]`），由 `run_analysis.py` 提取汇总到总章——列出有疑点的数据，不做最终判定，由 agent 决定是否深入
 - 脚本只负责**数据提取和压缩**，不做优化决策——决策由 agent 结合源码分析完成
 - Call Stack 不做任何过滤，保证信息完整性
